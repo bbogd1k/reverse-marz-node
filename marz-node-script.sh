@@ -192,24 +192,58 @@ openssl dhparam -out /etc/nginx/dhparam.pem 2048 || error "Ошибка при �
 
 log "==================== НАСТРОЙКА SSL И NGINX ===================="
 mkdir -p /etc/letsencrypt
+
+# Создаем конфиг для Cloudflare
 cat > /etc/letsencrypt/cloudflare.ini << EOF
 dns_cloudflare_email = ${CF_EMAIL}
 dns_cloudflare_api_key = ${CF_API_KEY}
 EOF
 chmod 600 /etc/letsencrypt/cloudflare.ini
 
-log "Получение SSL сертификатов..."
-certbot certonly \
-    --dns-cloudflare \
-    --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
-    -d ${MAIN_DOMAIN} \
-    -d *.${MAIN_DOMAIN} \
-    --agree-tos \
-    -n \
-    --email ${CF_EMAIL} || error "Ошибка при получении SSL сертификатов"
+# Функция для получения сертификата
+get_certificate() {
+    PROVIDER=$1
+    SERVER=$2
+    log "Попытка получить сертификат через $PROVIDER..."
 
-echo "0 4 * * 2 [ \$((\$(date +\%s) / 604800 \% 2)) -eq 0 ] && root certbot renew --quiet --deploy-hook 'systemctl reload nginx' --random-sleep-on-renew" > /etc/cron.d/certbot-renew
+    certbot certonly \
+        --dns-cloudflare \
+        --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+        -d ${MAIN_DOMAIN} \
+        -d *.${MAIN_DOMAIN} \
+        --agree-tos \
+        -n \
+        --server $SERVER \
+        --email ${CF_EMAIL} \
+        --preferred-challenges dns-01
+
+    if [ $? -eq 0 ]; then
+        log "Сертификат успешно получен через $PROVIDER!"
+        return 0
+    else
+        warning "Не удалось получить сертификат через $PROVIDER."
+        return 1
+    fi
+}
+
+# Попытка получить сертификат сначала от Let's Encrypt
+if ! get_certificate "Let's Encrypt" "https://acme-v02.api.letsencrypt.org/directory"; then
+    # Если не получилось, пробуем ZeroSSL
+    if ! get_certificate "ZeroSSL" "https://acme.zerossl.com/v2/DV90"; then
+        # Если не получилось, пробуем Buypass
+        if ! get_certificate "Buypass" "https://api.buypass.com/acme/directory"; then
+            error "Не удалось получить SSL сертификат от всех доступных провайдеров."
+        fi
+    fi
+fi
+
+# Настраиваем автоматическое обновление сертификатов
+log "Настройка автоматического обновления сертификатов..."
+echo "0 4 * * 2 root certbot renew --quiet --deploy-hook 'systemctl reload nginx' --random-sleep-on-renew" > /etc/cron.d/certbot-renew
 chmod 644 /etc/cron.d/certbot-renew
+
+log "Настройка SSL завершена."
+
 
 log "Настройка конфигурации Nginx..."
 mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
