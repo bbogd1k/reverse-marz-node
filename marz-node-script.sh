@@ -85,7 +85,7 @@ if $INSTALL_SSH_KEY; then
 fi
 
 while true; do
-    read -p "Введите субдомен (например, us.domain.com): " SUBDOMAIN
+    read -p "Введите субдомен (например, de1.vpnabe.net): " SUBDOMAIN
     if [ -z "$SUBDOMAIN" ]; then
         warning "Субдомен не может быть пустым. Пожалуйста, введите значение."
     else
@@ -94,7 +94,7 @@ while true; do
 done
 
 while true; do
-    read -p "Введите имя ноды (например, us-node-1): " NODE_NAME
+    read -p "Введите имя ноды (например, de-node-1): " NODE_NAME
     if [ -z "$NODE_NAME" ]; then
         warning "Имя ноды не может быть пустым. Пожалуйста, введите значение."
     else
@@ -103,29 +103,22 @@ while true; do
 done
 
 while true; do
-    read -p "Введите email для Cloudflare: " CF_EMAIL
-    if [ -z "$CF_EMAIL" ]; then
-        warning "Email не может быть пустым. Пожалуйста, введите значение."
+    read -p "Введите API токен deSEC: " DESEC_TOKEN
+    if [ -z "$DESEC_TOKEN" ]; then
+        warning "API токен не может быть пустым. Пожалуйста, введите значение."
     else
         break
     fi
 done
 
-while true; do
-    read -p "Введите Global API ключ Cloudflare: " CF_API_KEY
-    if [ -z "$CF_API_KEY" ]; then
-        warning "API ключ не может быть пустым. Пожалуйста, введите значение."
-    else
-        break
-    fi
-done
+read -p "Введите email для Let's Encrypt уведомлений: " LE_EMAIL
 
 read -p "Введите порт для сервиса (по умолчанию 62050): " SERVICE_PORT
 SERVICE_PORT=${SERVICE_PORT:-62050}
 read -p "Введите порт для API (по умолчанию 62051): " API_PORT
 API_PORT=${API_PORT:-62051}
 
-# Запрос SSL сертификата
+# Запрос SSL сертификата для Marzban (client cert)
 log "Введите SSL client сертификат (После Enter - Ctrl+D для завершения ввода):"
 SSL_CERT=$(cat)
 if [ -z "$SSL_CERT" ]; then
@@ -141,7 +134,7 @@ fi
 debug "Установлены следующие значения:"
 debug "Субдомен: ${SUBDOMAIN}"
 debug "Название ноды: ${NODE_NAME}"
-debug "Email: ${CF_EMAIL}"
+debug "Email: ${LE_EMAIL}"
 debug "Service port: ${SERVICE_PORT}"
 debug "API port: ${API_PORT}"
 
@@ -158,7 +151,7 @@ apt update 2>&1 | while read -r line; do debug "$line"; done
 apt upgrade -y 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при обновлении системы"
 
 log "Шаг 1.2: Установка базовых пакетов..."
-apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
+apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat netcat-traditional unzip jq 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
 
 # ======================== Опциональная установка BBR ========================
 if $INSTALL_BBR; then
@@ -186,69 +179,40 @@ echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx
 echo -e "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" | tee /etc/apt/preferences.d/99nginx
 apt update 2>&1 | while read -r line; do debug "$line"; done
 apt install -y nginx || error "Ошибка при установке Nginx"
-apt install -y certbot python3-certbot-dns-cloudflare || error "Ошибка при установке Certbot"
 mkdir -p /etc/nginx
 openssl dhparam -out /etc/nginx/dhparam.pem 2048 || error "Ошибка при генерации dhparam"
 
-log "==================== НАСТРОЙКА SSL И NGINX ===================="
-mkdir -p /etc/letsencrypt
+# ======================== НАСТРОЙКА SSL через deSEC/acme.sh ========================
 
-# Создаем конфиг для Cloudflare
-cat > /etc/letsencrypt/cloudflare.ini << EOF
-dns_cloudflare_email = ${CF_EMAIL}
-dns_cloudflare_api_key = ${CF_API_KEY}
-EOF
-chmod 600 /etc/letsencrypt/cloudflare.ini
+log "Установка acme.sh с поддержкой deSEC.io..."
+curl https://get.acme.sh | sh || error "Ошибка при установке acme.sh"
+export DESEC_Token="${DESEC_TOKEN}"
+source ~/.bashrc
 
-# Функция для получения сертификата
-get_certificate() {
-    PROVIDER=$1
-    SERVER=$2
-    log "Попытка получить сертификат через $PROVIDER..."
+log "Регистрация аккаунта Let's Encrypt и выпуск SSL для ${SUBDOMAIN} через deSEC..."
+~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+~/.acme.sh/acme.sh --register-account -m "${LE_EMAIL}" --server letsencrypt
 
-    certbot certonly \
-        --dns-cloudflare \
-        --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
-        -d ${MAIN_DOMAIN} \
-        -d *.${MAIN_DOMAIN} \
-        --agree-tos \
-        -n \
-        --server $SERVER \
-        --email ${CF_EMAIL} \
-        --preferred-challenges dns-01
+~/.acme.sh/acme.sh --issue --dns dns_desec -d "${SUBDOMAIN}" || error "Не удалось получить SSL сертификат через deSEC"
 
-    if [ $? -eq 0 ]; then
-        log "Сертификат успешно получен через $PROVIDER!"
-        return 0
-    else
-        warning "Не удалось получить сертификат через $PROVIDER."
-        return 1
-    fi
-}
+mkdir -p /etc/letsencrypt/live/${MAIN_DOMAIN}
+~/.acme.sh/acme.sh --install-cert -d "${SUBDOMAIN}" \
+  --key-file /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem \
+  --fullchain-file /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem \
+  --cert-file /etc/letsencrypt/live/${MAIN_DOMAIN}/cert.pem \
+  --ca-file /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem \
+  --reloadcmd "systemctl reload nginx"
 
-# Попытка получить сертификат сначала от Let's Encrypt
-if ! get_certificate "Let's Encrypt" "https://acme-v02.api.letsencrypt.org/directory"; then
-    # Если не получилось, пробуем ZeroSSL
-    if ! get_certificate "ZeroSSL" "https://acme.zerossl.com/v2/DV90"; then
-        # Если не получилось, пробуем Buypass
-        if ! get_certificate "Buypass" "https://api.buypass.com/acme/directory"; then
-            error "Не удалось получить SSL сертификат от всех доступных провайдеров."
-        fi
-    fi
-fi
+echo "0 3 * * * root ~/.acme.sh/acme.sh --cron --home ~/.acme.sh > /dev/null" > /etc/cron.d/acme-renew
+chmod 644 /etc/cron.d/acme-renew
 
-# Настраиваем автоматическое обновление сертификатов
-log "Настройка автоматического обновления сертификатов..."
-echo "0 4 * * 2 root certbot renew --quiet --deploy-hook 'systemctl reload nginx' --random-sleep-on-renew" > /etc/cron.d/certbot-renew
-chmod 644 /etc/cron.d/certbot-renew
+log "Сертификат успешно получен и установлен через deSEC."
 
-log "Настройка SSL завершена."
-
-
+# ======================== НАСТРОЙКА NGINX CONFIG ========================
 log "Настройка конфигурации Nginx..."
-mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup 2>/dev/null
 
-cat > /etc/nginx/nginx.conf << 'EOF'
+cat > /etc/nginx/nginx.conf << EOF
 user                                   www-data;
 pid                                    /var/run/nginx.pid;
 worker_processes                       auto;
@@ -260,19 +224,19 @@ events {
     worker_connections                   1024;
 }
 http {
-    map $request_uri $cleaned_request_uri {
-        default $request_uri;
-        "~^(.*?)(\?x_padding=[^ ]*)$" $1;
+    map \$request_uri \$cleaned_request_uri {
+        default \$request_uri;
+        "~^(.*?)(\?x_padding=[^ ]*)\$" \$1;
     }
     log_format json_analytics escape=json '{'
-        '$time_local, '
-        '$http_x_forwarded_for, '
-        '$proxy_protocol_addr, '
-        '$request_method '
-        '$status, '
-        '$http_user_agent, '
-        '$cleaned_request_uri, '
-        '$http_referer, '
+        '\$time_local, '
+        '\$http_x_forwarded_for, '
+        '\$proxy_protocol_addr, '
+        '\$request_method '
+        '\$status, '
+        '\$http_user_agent, '
+        '\$cleaned_request_uri, '
+        '\$http_referer, '
         '}';
     set_real_ip_from                     127.0.0.1;
     real_ip_header                       X-Forwarded-For;
