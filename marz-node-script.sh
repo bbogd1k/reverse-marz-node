@@ -107,6 +107,7 @@ while true; do
     if [ -z "$DESEC_TOKEN" ]; then
         warning "API токен не может быть пустым. Пожалуйста, введите значение."
     else
+        export DEDYN_TOKEN="$DESEC_TOKEN"
         break
     fi
 done
