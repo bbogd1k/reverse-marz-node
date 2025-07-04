@@ -85,7 +85,7 @@ if $INSTALL_SSH_KEY; then
 fi
 
 while true; do
-    read -p "Введите субдомен (например, de1.vpnabe.net): " SUBDOMAIN
+    read -p "Введите субдомен (например, us.domain.com): " SUBDOMAIN
     if [ -z "$SUBDOMAIN" ]; then
         warning "Субдомен не может быть пустым. Пожалуйста, введите значение."
     else
@@ -94,7 +94,7 @@ while true; do
 done
 
 while true; do
-    read -p "Введите имя ноды (например, de-node-1): " NODE_NAME
+    read -p "Введите имя ноды (например, us-node-1): " NODE_NAME
     if [ -z "$NODE_NAME" ]; then
         warning "Имя ноды не может быть пустым. Пожалуйста, введите значение."
     else
@@ -103,23 +103,20 @@ while true; do
 done
 
 while true; do
-    read -p "Введите API токен deSEC: " DESEC_TOKEN
-    if [ -z "$DESEC_TOKEN" ]; then
-        warning "API токен не может быть пустым. Пожалуйста, введите значение."
+    read -p "Введите API токен deSEC (DEDYN_TOKEN): " DEDYN_TOKEN
+    if [ -z "$DEDYN_TOKEN" ]; then
+        warning "Токен deSEC не может быть пустым. Пожалуйста, введите значение."
     else
-        export DEDYN_TOKEN="$DESEC_TOKEN"
         break
     fi
 done
-
-read -p "Введите email для Let's Encrypt уведомлений: " LE_EMAIL
 
 read -p "Введите порт для сервиса (по умолчанию 62050): " SERVICE_PORT
 SERVICE_PORT=${SERVICE_PORT:-62050}
 read -p "Введите порт для API (по умолчанию 62051): " API_PORT
 API_PORT=${API_PORT:-62051}
 
-# Запрос SSL сертификата для Marzban (client cert)
+# Запрос SSL client сертификата (для Marzban Node)
 log "Введите SSL client сертификат (После Enter - Ctrl+D для завершения ввода):"
 SSL_CERT=$(cat)
 if [ -z "$SSL_CERT" ]; then
@@ -135,7 +132,6 @@ fi
 debug "Установлены следующие значения:"
 debug "Субдомен: ${SUBDOMAIN}"
 debug "Название ноды: ${NODE_NAME}"
-debug "Email: ${LE_EMAIL}"
 debug "Service port: ${SERVICE_PORT}"
 debug "API port: ${API_PORT}"
 
@@ -152,7 +148,7 @@ apt update 2>&1 | while read -r line; do debug "$line"; done
 apt upgrade -y 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при обновлении системы"
 
 log "Шаг 1.2: Установка базовых пакетов..."
-apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat netcat-traditional unzip jq 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
+apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
 
 # ======================== Опциональная установка BBR ========================
 if $INSTALL_BBR; then
@@ -183,37 +179,36 @@ apt install -y nginx || error "Ошибка при установке Nginx"
 mkdir -p /etc/nginx
 openssl dhparam -out /etc/nginx/dhparam.pem 2048 || error "Ошибка при генерации dhparam"
 
-# ======================== НАСТРОЙКА SSL через deSEC/acme.sh ========================
+# ======================== SSL через deSEC + acme.sh ========================
+export DEDYN_TOKEN="$DEDYN_TOKEN"
 
-log "Установка acme.sh с поддержкой deSEC.io..."
-curl https://get.acme.sh | sh || error "Ошибка при установке acme.sh"
-export DESEC_Token="${DESEC_TOKEN}"
-source ~/.bashrc
+if ! command -v acme.sh >/dev/null 2>&1; then
+  log "Установка acme.sh для выпуска wildcard SSL сертификата через deSEC..."
+  curl https://get.acme.sh | sh
+  export PATH="$HOME/.acme.sh":$PATH
+fi
 
-log "Регистрация аккаунта Let's Encrypt и выпуск SSL для ${SUBDOMAIN} через deSEC..."
-~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-~/.acme.sh/acme.sh --register-account -m "${LE_EMAIL}" --server letsencrypt
+log "Регистрация Let's Encrypt и выпуск wildcard SSL для ${MAIN_DOMAIN} и *.${MAIN_DOMAIN} через deSEC..."
+~/.acme.sh/acme.sh --issue --dns dns_desec -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --dnssleep 120 || error "Не удалось получить wildcard сертификат через deSEC"
 
-~/.acme.sh/acme.sh --issue --dns dns_desec -d "${SUBDOMAIN}" || error "Не удалось получить SSL сертификат через deSEC"
+log "Установка сертификатов в стандартные пути для nginx..."
+~/.acme.sh/acme.sh --install-cert -d "${MAIN_DOMAIN}" \
+    --key-file /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem \
+    --fullchain-file /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem \
+    --cert-file /etc/letsencrypt/live/${MAIN_DOMAIN}/cert.pem \
+    --ca-file /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem \
+    --reloadcmd "systemctl reload nginx"
 
-mkdir -p /etc/letsencrypt/live/${MAIN_DOMAIN}
-~/.acme.sh/acme.sh --install-cert -d "${SUBDOMAIN}" \
-  --key-file /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem \
-  --fullchain-file /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem \
-  --cert-file /etc/letsencrypt/live/${MAIN_DOMAIN}/cert.pem \
-  --ca-file /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem \
-  --reloadcmd "systemctl reload nginx"
+chmod 600 /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem
+chmod 644 /etc/letsencrypt/live/${MAIN_DOMAIN}/*.pem
 
-echo "0 3 * * * root ~/.acme.sh/acme.sh --cron --home ~/.acme.sh > /dev/null" > /etc/cron.d/acme-renew
-chmod 644 /etc/cron.d/acme-renew
+log "Wildcard SSL сертификат успешно выпущен и установлен для ${MAIN_DOMAIN} и всех поддоменов!"
 
-log "Сертификат успешно получен и установлен через deSEC."
-
-# ======================== НАСТРОЙКА NGINX CONFIG ========================
+# ======================== Настройка NGINX ========================
 log "Настройка конфигурации Nginx..."
-mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup 2>/dev/null
+mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
 
-cat > /etc/nginx/nginx.conf << EOF
+cat > /etc/nginx/nginx.conf << 'EOF'
 user                                   www-data;
 pid                                    /var/run/nginx.pid;
 worker_processes                       auto;
@@ -225,19 +220,19 @@ events {
     worker_connections                   1024;
 }
 http {
-    map \$request_uri \$cleaned_request_uri {
-        default \$request_uri;
-        "~^(.*?)(\?x_padding=[^ ]*)\$" \$1;
+    map $request_uri $cleaned_request_uri {
+        default $request_uri;
+        "~^(.*?)(\?x_padding=[^ ]*)$" $1;
     }
     log_format json_analytics escape=json '{'
-        '\$time_local, '
-        '\$http_x_forwarded_for, '
-        '\$proxy_protocol_addr, '
-        '\$request_method '
-        '\$status, '
-        '\$http_user_agent, '
-        '\$cleaned_request_uri, '
-        '\$http_referer, '
+        '$time_local, '
+        '$http_x_forwarded_for, '
+        '$proxy_protocol_addr, '
+        '$request_method '
+        '$status, '
+        '$http_user_agent, '
+        '$cleaned_request_uri, '
+        '$http_referer, '
         '}';
     set_real_ip_from                     127.0.0.1;
     real_ip_header                       X-Forwarded-For;
@@ -376,7 +371,7 @@ cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
             <button type="submit" class="submit-btn">Log In</button>
         </form>
         <div class="footer">
-            <p>Protected by CloudFlare</p>
+            <p>Protected by deSEC</p>
         </div>
     </div>
 </body>
