@@ -49,7 +49,7 @@ fi
 log "==================== НАЧАЛО УСТАНОВКИ ===================="
 log "Этап 0: Сбор необходимых данных..."
 
-# Запрос SSH порта
+# SSH порт
 while true; do
     read -p "Введите порт для SSH (по умолчанию 22): " SSH_PORT
     SSH_PORT=${SSH_PORT:-22}
@@ -60,7 +60,7 @@ while true; do
     fi
 done
 
-# Запрос IP мастер-ноды
+# IP мастер-ноды
 while true; do
     read -p "Введите IP адрес мастер-ноды: " MASTER_IP
     if [[ $MASTER_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -70,6 +70,7 @@ while true; do
     fi
 done
 
+# SSH-ключ
 if $INSTALL_SSH_KEY; then
     while true; do
         log "Введите ваш публичный SSH ключ (должен начинаться с 'ssh-rsa' или 'ssh-ed25519'):"
@@ -102,12 +103,23 @@ while true; do
     fi
 done
 
+# deSEC API токен
 while true; do
-    read -p "Введите API токен deSEC (DEDYN_TOKEN): " DEDYN_TOKEN
+    read -p "Введите API-токен deSEC (DEDYN_TOKEN): " DEDYN_TOKEN
     if [ -z "$DEDYN_TOKEN" ]; then
-        warning "Токен deSEC не может быть пустым. Пожалуйста, введите значение."
+        warning "DEDYN_TOKEN не может быть пустым. Пожалуйста, введите значение."
     else
         break
+    fi
+done
+
+# Let's Encrypt email
+while true; do
+    read -p "Введите ваш email для Let's Encrypt: " LE_EMAIL
+    if [[ "$LE_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        break
+    else
+        warning "Некорректный email. Попробуйте снова."
     fi
 done
 
@@ -116,45 +128,24 @@ SERVICE_PORT=${SERVICE_PORT:-62050}
 read -p "Введите порт для API (по умолчанию 62051): " API_PORT
 API_PORT=${API_PORT:-62051}
 
-# Запрос SSL client сертификата (для Marzban Node)
-log "Введите SSL client сертификат (После Enter - Ctrl+D для завершения ввода):"
-SSL_CERT=$(cat)
-if [ -z "$SSL_CERT" ]; then
-    error "SSL сертификат не может быть пустым."
-fi
+log "Установлены значения:"
+log "Субдомен: ${SUBDOMAIN}"
+log "Название ноды: ${NODE_NAME}"
+log "Service port: ${SERVICE_PORT}"
+log "API port: ${API_PORT}"
 
-# Извлечение тела сертификата (без BEGIN/END)
-CERT_BODY=$(echo "$SSL_CERT" | grep -v "BEGIN CERTIFICATE" | grep -v "END CERTIFICATE" | tr -d '\n')
-if [[ ! $CERT_BODY =~ ^[A-Za-z0-9+/=]+$ ]]; then
-    error "Некорректный формат сертификата. Пожалуйста, предоставьте валидный SSL сертификат."
-fi
-
-debug "Установлены следующие значения:"
-debug "Субдомен: ${SUBDOMAIN}"
-debug "Название ноды: ${NODE_NAME}"
-debug "Service port: ${SERVICE_PORT}"
-debug "API port: ${API_PORT}"
-
-# Извлечение основного домена
 MAIN_DOMAIN=$(echo ${SUBDOMAIN} | awk -F. '{print $(NF-1)"."$NF}')
 debug "Основной домен: ${MAIN_DOMAIN}"
 
 # ======================== Установка системных компонентов ========================
-log "==================== СИСТЕМНЫЕ КОМПОНЕНТЫ ===================="
-log "Этап 1: Установка системных компонентов..."
-
-log "Шаг 1.1: Обновление системы..."
+log "Установка системных компонентов..."
 apt update 2>&1 | while read -r line; do debug "$line"; done
 apt upgrade -y 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при обновлении системы"
-
-log "Шаг 1.2: Установка базовых пакетов..."
-apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
+apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat bash 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
 
 # ======================== Опциональная установка BBR ========================
 if $INSTALL_BBR; then
-    log "==================== УСТАНОВКА BBRv3 ===================="
-    log "Шаг 1.3: Установка BBRv3..."
-    debug "Загрузка скрипта BBRv3..."
+    log "Установка BBRv3..."
     curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 > bbrv3.sh || error "Ошибка при скачивании BBRv3"
     expect << 'EOF'
 spawn bash bbrv3.sh
@@ -165,59 +156,54 @@ send "y\r"
 expect eof
 EOF
     rm bbrv3.sh
-else
-    debug "Опциональная установка BBR пропущена."
 fi
 
-log "==================== УСТАНОВКА NGINX ===================="
+# ======================== Установка nginx ========================
+log "Установка nginx..."
 curl https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
-gpg --dry-run --quiet --no-keyring --import --import-options import-show /usr/share/keyrings/nginx-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" | tee /etc/apt/sources.list.d/nginx.list
 echo -e "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" | tee /etc/apt/preferences.d/99nginx
 apt update 2>&1 | while read -r line; do debug "$line"; done
-apt install -y nginx || error "Ошибка при установке Nginx"
+apt install -y nginx || error "Ошибка при установке nginx"
 mkdir -p /etc/nginx
 openssl dhparam -out /etc/nginx/dhparam.pem 2048 || error "Ошибка при генерации dhparam"
 
-# ======================== SSL через deSEC + acme.sh ========================
-export DEDYN_TOKEN="$DEDYN_TOKEN"
+# ======================== acme.sh для deSEC ========================
+log "Установка acme.sh для SSL через deSEC..."
+curl https://get.acme.sh | sh || error "Ошибка при установке acme.sh"
+export DEDYN_TOKEN="${DEDYN_TOKEN}"
+export LE_WORKING_DIR="${HOME}/.acme.sh"
 
-if ! command -v acme.sh >/dev/null 2>&1; then
-  log "Установка acme.sh для выпуска wildcard SSL сертификата через deSEC..."
-  curl https://get.acme.sh | sh
-  export PATH="$HOME/.acme.sh":$PATH
-fi
+# регистрация LE аккаунта (повторная безопасна)
+"${LE_WORKING_DIR}/acme.sh" --register-account -m "$LE_EMAIL" --server letsencrypt
 
-log "Регистрация Let's Encrypt и выпуск wildcard SSL для ${MAIN_DOMAIN} и *.${MAIN_DOMAIN} через deSEC..."
-~/.acme.sh/acme.sh --issue --dns dns_desec -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --dnssleep 120 || error "Не удалось получить wildcard сертификат через deSEC"
+# ====== Получение wildcard сертификата для основного домена и всех поддоменов
+log "[INFO] Регистрация Let's Encrypt и выпуск wildcard SSL для ${MAIN_DOMAIN} и *.${MAIN_DOMAIN} через deSEC..."
+"${LE_WORKING_DIR}/acme.sh" --issue --dns dns_desec -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --server letsencrypt --dnssleep 120 || error "Не удалось получить wildcard сертификат через deSEC"
 
-log "Установка сертификатов в стандартные пути для nginx..."
-~/.acme.sh/acme.sh --install-cert -d "${MAIN_DOMAIN}" \
-    --key-file /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem \
+# Установка сертификатов в привычные места для nginx
+mkdir -p /etc/letsencrypt/live/${MAIN_DOMAIN}
+"${LE_WORKING_DIR}/acme.sh" --install-cert -d "${MAIN_DOMAIN}" \
     --fullchain-file /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem \
+    --key-file /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem \
     --cert-file /etc/letsencrypt/live/${MAIN_DOMAIN}/cert.pem \
     --ca-file /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem \
     --reloadcmd "systemctl reload nginx"
 
-chmod 600 /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem
-chmod 644 /etc/letsencrypt/live/${MAIN_DOMAIN}/*.pem
-
-log "Wildcard SSL сертификат успешно выпущен и установлен для ${MAIN_DOMAIN} и всех поддоменов!"
-
-# ======================== Настройка NGINX ========================
-log "Настройка конфигурации Nginx..."
-mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+# ========== Настройка nginx
+log "Настройка конфигурации nginx..."
+mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup 2>/dev/null
 
 cat > /etc/nginx/nginx.conf << 'EOF'
-user                                   www-data;
-pid                                    /var/run/nginx.pid;
-worker_processes                       auto;
-worker_rlimit_nofile                   65535;
-error_log                              /var/log/nginx/error.log;
-include                                /etc/nginx/modules-enabled/*.conf;
+user  www-data;
+pid   /var/run/nginx.pid;
+worker_processes auto;
+worker_rlimit_nofile 65535;
+error_log  /var/log/nginx/error.log;
+include /etc/nginx/modules-enabled/*.conf;
 events {
-    multi_accept                         on;
-    worker_connections                   1024;
+    multi_accept on;
+    worker_connections 1024;
 }
 http {
     map $request_uri $cleaned_request_uri {
@@ -234,42 +220,42 @@ http {
         '$cleaned_request_uri, '
         '$http_referer, '
         '}';
-    set_real_ip_from                     127.0.0.1;
-    real_ip_header                       X-Forwarded-For;
-    real_ip_recursive                    on;
-    access_log                           /var/log/nginx/access.log json_analytics;
-    sendfile                             on;
-    tcp_nopush                           on;
-    tcp_nodelay                          on;
-    server_tokens                        off;
-    log_not_found                        off;
-    types_hash_max_size                  2048;
-    types_hash_bucket_size               64;
-    client_max_body_size                 16M;
-    keepalive_timeout                    75s;
-    keepalive_requests                   1000;
-    reset_timedout_connection            on;
-    include                              /etc/nginx/mime.types;
-    default_type                         application/octet-stream;
-    ssl_session_timeout                  1d;
-    ssl_session_cache                    shared:SSL:1m;
-    ssl_session_tickets                  off;
-    ssl_prefer_server_ciphers            on;
-    ssl_protocols                        TLSv1.2 TLSv1.3;
-    ssl_ciphers                          TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
-    ssl_stapling                         on;
-    ssl_stapling_verify                  on;
-    resolver                             127.0.0.1 valid=60s;
-    resolver_timeout                     2s;
-    gzip                                 on;
-    add_header X-XSS-Protection          "0" always;
-    add_header X-Content-Type-Options    "nosniff" always;
-    add_header Referrer-Policy           "no-referrer-when-downgrade" always;
-    add_header Permissions-Policy        "interest-cohort=()" always;
+    set_real_ip_from 127.0.0.1;
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+    access_log /var/log/nginx/access.log json_analytics;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    server_tokens off;
+    log_not_found off;
+    types_hash_max_size 2048;
+    types_hash_bucket_size 64;
+    client_max_body_size 16M;
+    keepalive_timeout 75s;
+    keepalive_requests 1000;
+    reset_timedout_connection on;
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:1m;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers on;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 127.0.0.1 valid=60s;
+    resolver_timeout 2s;
+    gzip on;
+    add_header X-XSS-Protection "0" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Permissions-Policy "interest-cohort=()" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
-    add_header X-Frame-Options           "SAMEORIGIN";
-    proxy_hide_header                    X-Powered-By;
-    include                              /etc/nginx/conf.d/*.conf;
+    add_header X-Frame-Options "SAMEORIGIN";
+    proxy_hide_header X-Powered-By;
+    include /etc/nginx/conf.d/*.conf;
 }
 stream {
     include /etc/nginx/stream-enabled/stream.conf;
@@ -281,8 +267,8 @@ rm -f /etc/nginx/conf.d/default.conf
 
 cat > /etc/nginx/stream-enabled/stream.conf << EOF
 map \$ssl_preread_server_name \$backend {
-    default                              block;
-    ${SUBDOMAIN}                         web;
+    default block;
+    ${SUBDOMAIN} web;
 }
 upstream block {
     server 127.0.0.1:36076;
@@ -382,8 +368,7 @@ chown -R www-data:www-data /var/www/${SUBDOMAIN}
 chmod -R 755 /var/www/${SUBDOMAIN}
 
 # ======================== Установка Marzban Node ========================
-log "==================== УСТАНОВКА MARZBAN NODE ===================="
-log "Этап 3: Установка Marzban Node..."
+log "Установка Marzban Node..."
 curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh > marzban-node.sh
 chmod +x marzban-node.sh
 
@@ -391,7 +376,7 @@ expect << EOF
 spawn ./marzban-node.sh @ install --name ${NODE_NAME}
 expect "Please paste the content of the Client Certificate"
 send -- "-----BEGIN CERTIFICATE-----\n"
-send -- "${CERT_BODY}\n"
+send -- "\n"
 send -- "-----END CERTIFICATE-----\n\n"
 expect "Do you want to use REST protocol?"
 send -- "y\n"
@@ -419,14 +404,13 @@ else
     warning "Файл docker-compose.yml не найден, пропуск настройки монтирования логов."
 fi
 
-# ======================== Финальные проверки и настройки ========================
-log "==================== ФИНАЛЬНЫЕ ПРОВЕРКИ ===================="
-nginx -t 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка в конфигурации Nginx"
-
+# ======================== Финальные проверки ========================
+log "Финальные проверки и запуск nginx..."
+nginx -t 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка в конфигурации nginx"
 systemctl enable nginx 2>&1 | while read -r line; do debug "$line"; done
 systemctl start nginx 2>&1 | while read -r line; do debug "$line"; done
 if ! systemctl is-active --quiet nginx; then
-    error "Не удалось запустить Nginx"
+    error "Не удалось запустить nginx"
 fi
 
 log "Настройка UFW..."
@@ -447,8 +431,6 @@ if $INSTALL_SSH_KEY; then
     cat > /root/.ssh/authorized_keys << EOF
 ${SSH_KEY}
 EOF
-
-    # Настройка базового конфига SSH
     cat > /etc/ssh/sshd_config << EOF
 Port ${SSH_PORT}
 Protocol 2
@@ -461,7 +443,6 @@ MaxAuthTries 3
 LoginGraceTime 60
 AllowUsers root
 EOF
-
     systemctl restart ssh
     if ! systemctl is-active --quiet ssh; then
         error "Не удалось запустить SSH"
