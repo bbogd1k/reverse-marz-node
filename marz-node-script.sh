@@ -49,7 +49,6 @@ fi
 log "==================== НАЧАЛО УСТАНОВКИ ===================="
 log "Этап 0: Сбор необходимых данных..."
 
-# SSH порт
 while true; do
     read -p "Введите порт для SSH (по умолчанию 22): " SSH_PORT
     SSH_PORT=${SSH_PORT:-22}
@@ -60,7 +59,6 @@ while true; do
     fi
 done
 
-# IP мастер-ноды
 while true; do
     read -p "Введите IP адрес мастер-ноды: " MASTER_IP
     if [[ $MASTER_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -70,7 +68,6 @@ while true; do
     fi
 done
 
-# SSH-ключ
 if $INSTALL_SSH_KEY; then
     while true; do
         log "Введите ваш публичный SSH ключ (должен начинаться с 'ssh-rsa' или 'ssh-ed25519'):"
@@ -103,23 +100,21 @@ while true; do
     fi
 done
 
-# deSEC API токен
 while true; do
-    read -p "Введите API-токен deSEC (DEDYN_TOKEN): " DEDYN_TOKEN
-    if [ -z "$DEDYN_TOKEN" ]; then
-        warning "DEDYN_TOKEN не может быть пустым. Пожалуйста, введите значение."
+    read -p "Введите deSEC API-токен: " DESEC_TOKEN
+    if [ -z "$DESEC_TOKEN" ]; then
+        warning "API-токен не может быть пустым. Пожалуйста, введите значение."
     else
         break
     fi
 done
 
-# Let's Encrypt email
 while true; do
-    read -p "Введите ваш email для Let's Encrypt: " LE_EMAIL
-    if [[ "$LE_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
-        break
+    read -p "Введите email для Let's Encrypt (обязательно, не фейк): " LE_EMAIL
+    if [ -z "$LE_EMAIL" ]; then
+        warning "Email не может быть пустым. Пожалуйста, введите значение."
     else
-        warning "Некорректный email. Попробуйте снова."
+        break
     fi
 done
 
@@ -128,20 +123,30 @@ SERVICE_PORT=${SERVICE_PORT:-62050}
 read -p "Введите порт для API (по умолчанию 62051): " API_PORT
 API_PORT=${API_PORT:-62051}
 
-log "Установлены значения:"
-log "Субдомен: ${SUBDOMAIN}"
-log "Название ноды: ${NODE_NAME}"
-log "Service port: ${SERVICE_PORT}"
-log "API port: ${API_PORT}"
+log "Введите SSL client сертификат (После Enter - Ctrl+D для завершения ввода):"
+SSL_CERT=$(cat)
+if [ -z "$SSL_CERT" ]; then
+    error "SSL сертификат не может быть пустым."
+fi
+
+CERT_BODY=$(echo "$SSL_CERT" | grep -v "BEGIN CERTIFICATE" | grep -v "END CERTIFICATE" | tr -d '\n')
+if [[ ! $CERT_BODY =~ ^[A-Za-z0-9+/=]+$ ]]; then
+    error "Некорректный формат сертификата. Пожалуйста, предоставьте валидный SSL сертификат."
+fi
+
+debug "Субдомен: ${SUBDOMAIN}"
+debug "Название ноды: ${NODE_NAME}"
+debug "Service port: ${SERVICE_PORT}"
+debug "API port: ${API_PORT}"
 
 MAIN_DOMAIN=$(echo ${SUBDOMAIN} | awk -F. '{print $(NF-1)"."$NF}')
 debug "Основной домен: ${MAIN_DOMAIN}"
 
 # ======================== Установка системных компонентов ========================
-log "Установка системных компонентов..."
+log "Системные компоненты..."
 apt update 2>&1 | while read -r line; do debug "$line"; done
 apt upgrade -y 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при обновлении системы"
-apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat bash 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
+apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
 
 # ======================== Опциональная установка BBR ========================
 if $INSTALL_BBR; then
@@ -156,50 +161,50 @@ send "y\r"
 expect eof
 EOF
     rm bbrv3.sh
+else
+    debug "BBR не устанавливается."
 fi
 
-# ======================== Установка nginx ========================
-log "Установка nginx..."
+log "Установка NGINX и acme.sh..."
 curl https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
+gpg --dry-run --quiet --no-keyring --import --import-options import-show /usr/share/keyrings/nginx-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" | tee /etc/apt/sources.list.d/nginx.list
 echo -e "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" | tee /etc/apt/preferences.d/99nginx
 apt update 2>&1 | while read -r line; do debug "$line"; done
-apt install -y nginx || error "Ошибка при установке nginx"
+apt install -y nginx || error "Ошибка при установке Nginx"
 mkdir -p /etc/nginx
 openssl dhparam -out /etc/nginx/dhparam.pem 2048 || error "Ошибка при генерации dhparam"
 
-# ======================== acme.sh для deSEC ========================
-log "Установка acme.sh для SSL через deSEC..."
+# acme.sh install/update
+log "Установка/обновление acme.sh..."
 curl https://get.acme.sh | sh || error "Ошибка при установке acme.sh"
-export DEDYN_TOKEN="${DEDYN_TOKEN}"
-export LE_WORKING_DIR="${HOME}/.acme.sh"
+export DEDYN_TOKEN="${DESEC_TOKEN}"
+export LE_EMAIL="${LE_EMAIL}"
+export HOME="/root"
+. /root/.acme.sh/acme.sh.env
 
-# регистрация LE аккаунта (повторная безопасна)
-"${LE_WORKING_DIR}/acme.sh" --register-account -m "$LE_EMAIL" --server letsencrypt
+~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 
-# ====== Получение wildcard сертификата для основного домена и всех поддоменов
-log "[INFO] Регистрация Let's Encrypt и выпуск wildcard SSL для ${MAIN_DOMAIN} и *.${MAIN_DOMAIN} через deSEC..."
-"${LE_WORKING_DIR}/acme.sh" --issue --dns dns_desec -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --server letsencrypt --dnssleep 120 || error "Не удалось получить wildcard сертификат через deSEC"
+log "Регистрация аккаунта Let's Encrypt через acme.sh..."
+~/.acme.sh/acme.sh --register-account -m "${LE_EMAIL}" --server letsencrypt || warning "Аккаунт LE уже зарегистрирован"
 
-# Установка сертификатов в привычные места для nginx
+log "Выпуск wildcard SSL для ${MAIN_DOMAIN} и *.${MAIN_DOMAIN} через deSEC..."
+~/.acme.sh/acme.sh --issue --dns dns_desec -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --keylength ec-256 --dnssleep 120 --force --home /root/.acme.sh || error "Не удалось получить wildcard сертификат через deSEC"
+
 mkdir -p /etc/letsencrypt/live/${MAIN_DOMAIN}
-"${LE_WORKING_DIR}/acme.sh" --install-cert -d "${MAIN_DOMAIN}" \
-    --fullchain-file /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem \
-    --key-file /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem \
-    --cert-file /etc/letsencrypt/live/${MAIN_DOMAIN}/cert.pem \
-    --ca-file /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem \
-    --reloadcmd "systemctl reload nginx"
+cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/${MAIN_DOMAIN}.key /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem
+cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/fullchain.cer /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem
+cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/ca.cer /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem
 
-# ========== Настройка nginx
-log "Настройка конфигурации nginx..."
+log "Nginx конфиг..."
 mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup 2>/dev/null
 
 cat > /etc/nginx/nginx.conf << 'EOF'
-user  www-data;
-pid   /var/run/nginx.pid;
+user www-data;
+pid /var/run/nginx.pid;
 worker_processes auto;
 worker_rlimit_nofile 65535;
-error_log  /var/log/nginx/error.log;
+error_log /var/log/nginx/error.log;
 include /etc/nginx/modules-enabled/*.conf;
 events {
     multi_accept on;
@@ -357,7 +362,7 @@ cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
             <button type="submit" class="submit-btn">Log In</button>
         </form>
         <div class="footer">
-            <p>Protected by deSEC</p>
+            <p>Protected by CloudFlare</p>
         </div>
     </div>
 </body>
@@ -376,7 +381,7 @@ expect << EOF
 spawn ./marzban-node.sh @ install --name ${NODE_NAME}
 expect "Please paste the content of the Client Certificate"
 send -- "-----BEGIN CERTIFICATE-----\n"
-send -- "\n"
+send -- "${CERT_BODY}\n"
 send -- "-----END CERTIFICATE-----\n\n"
 expect "Do you want to use REST protocol?"
 send -- "y\n"
@@ -404,13 +409,11 @@ else
     warning "Файл docker-compose.yml не найден, пропуск настройки монтирования логов."
 fi
 
-# ======================== Финальные проверки ========================
-log "Финальные проверки и запуск nginx..."
-nginx -t 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка в конфигурации nginx"
+nginx -t 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка в конфигурации Nginx"
 systemctl enable nginx 2>&1 | while read -r line; do debug "$line"; done
 systemctl start nginx 2>&1 | while read -r line; do debug "$line"; done
 if ! systemctl is-active --quiet nginx; then
-    error "Не удалось запустить nginx"
+    error "Не удалось запустить Nginx"
 fi
 
 log "Настройка UFW..."
@@ -431,6 +434,7 @@ if $INSTALL_SSH_KEY; then
     cat > /root/.ssh/authorized_keys << EOF
 ${SSH_KEY}
 EOF
+
     cat > /etc/ssh/sshd_config << EOF
 Port ${SSH_PORT}
 Protocol 2
@@ -443,6 +447,7 @@ MaxAuthTries 3
 LoginGraceTime 60
 AllowUsers root
 EOF
+
     systemctl restart ssh
     if ! systemctl is-active --quiet ssh; then
         error "Не удалось запустить SSH"
