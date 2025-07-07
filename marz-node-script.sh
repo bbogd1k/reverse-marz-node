@@ -50,19 +50,20 @@ while true; do
         DNS_PROVIDER="gcore"
         DNS_API="dns_gcore"
         while true; do
-            read -p "Введите Gcore API-токен: " DNS_TOKEN
+            read -p "Введите Gcore API-ключ (поле API Key из Gcore, права на DNS): " DNS_TOKEN
             if [ -z "$DNS_TOKEN" ]; then
-                warning "Токен не может быть пустым."
+                warning "Ключ не может быть пустым."
             else
                 break
             fi
         done
-        export GCORE_API_KEY="$DNS_TOKEN"
+        export GCORE_Key="$DNS_TOKEN"
         break
     else
         warning "Только 1 (deSEC.io) или 2 (Gcore DNS)"
     fi
 done
+
 
 # ======================== Параметры ========================
 read -p "Установить BBR и Xanmod Kernel? (y/n): " ans_bbr
