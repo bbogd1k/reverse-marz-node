@@ -3,16 +3,16 @@
 clear
 echo -e "\033[1;31m"
 cat << "EOF"
- ▄▄▄▄   ██▓   ▄▄▄       ▄████ ▒█████ ▓█████▄ ▄▄▄      ██▀███ ▓█████ ███▄    █ 
-▓█████▄▓██▒  ▒████▄    ██▒ ▀█▒██▒  ██▒██▀ ██▒████▄   ▓██ ▒ ██▓█   ▀ ██ ▀█   █ 
-▒██▒ ▄█▒██░  ▒██  ▀█▄ ▒██░▄▄▄▒██░  ██░██   █▒██  ▀█▄ ▓██ ░▄█ ▒███  ▓██  ▀█ ██▒
-▒██░█▀ ▒██░  ░██▄▄▄▄██░▓█  ██▒██   ██░▓█▄   ░██▄▄▄▄██▒██▀▀█▄ ▒▓█  ▄▓██▒  ▐▌██▒
-░▓█  ▀█░██████▓█   ▓██░▒▓███▀░ ████▓▒░▒████▓ ▓█   ▓██░██▓ ▒██░▒████▒██░   ▓██░
-░▒▓███▀░ ▒░▓  ▒▒   ▓▒█░░▒   ▒░ ▒░▒░▒░ ▒▒▓  ▒ ▒▒   ▓▒█░ ▒▓ ░▒▓░░ ▒░ ░ ▒░   ▒ ▒ 
-▒░▒   ░░ ░ ▒  ░▒   ▒▒ ░ ░   ░  ░ ▒ ▒░ ░ ▒  ▒  ▒   ▒▒ ░ ░▒ ░ ▒░░ ░  ░ ░░   ░ ▒░
- ░    ░  ░ ░   ░   ▒  ░ ░   ░░ ░ ░ ▒  ░ ░  ░  ░   ▒    ░░   ░   ░     ░   ░ ░ 
- ░         ░  ░    ░  ░     ░    ░ ░    ░         ░  ░  ░       ░  ░        ░ 
-      ░                               ░                                       
+
+ __       __                          __     _  __         
+/\ \     /\ \                        /\ \  /' \/\ \        
+\ \ \____\ \ \____    ___      __    \_\ \/\_, \ \ \/'\    
+ \ \ '__`\\ \ '__`\  / __`\  /'_ `\  /'_` \/_/\ \ \ , <    
+  \ \ \L\ \\ \ \L\ \/\ \L\ \/\ \L\ \/\ \L\ \ \ \ \ \ \\`\  
+   \ \_,__/ \ \_,__/\ \____/\ \____ \ \___,_\ \ \_\ \_\ \_\
+    \/___/   \/___/  \/___/  \/___L\ \/__,_ /  \/_/\/_/\/_/
+                               /\____/                     
+                               \_/__/                                                          
 EOF
 echo -e "\033[0m"
 echo ""
@@ -27,20 +27,49 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 debug() { echo -e "[DEBUG] $1"; }
 
+# ======================== Выбор DNS-провайдера ========================
+while true; do
+    echo -e "${YELLOW}Выберите DNS-провайдера для выпуска wildcard сертификата:"
+    echo "1) deSEC.io"
+    echo "2) Gcore DNS"
+    read -p "Введите номер (1 или 2): " DNS_PROVIDER_NUM
+    if [[ "$DNS_PROVIDER_NUM" == "1" ]]; then
+        DNS_PROVIDER="desec"
+        DNS_API="dns_desec"
+        while true; do
+            read -p "Введите deSEC API-токен: " DNS_TOKEN
+            if [ -z "$DNS_TOKEN" ]; then
+                warning "Токен не может быть пустым."
+            else
+                break
+            fi
+        done
+        export DEDYN_TOKEN="$DNS_TOKEN"
+        break
+    elif [[ "$DNS_PROVIDER_NUM" == "2" ]]; then
+        DNS_PROVIDER="gcore"
+        DNS_API="dns_gcore"
+        while true; do
+            read -p "Введите Gcore API-токен: " DNS_TOKEN
+            if [ -z "$DNS_TOKEN" ]; then
+                warning "Токен не может быть пустым."
+            else
+                break
+            fi
+        done
+        export GCORE_API_KEY="$DNS_TOKEN"
+        break
+    else
+        warning "Только 1 (deSEC.io) или 2 (Gcore DNS)"
+    fi
+done
+
 # ======================== Параметры ========================
 read -p "Установить BBR и Xanmod Kernel? (y/n): " ans_bbr
-if [[ $ans_bbr =~ ^[Yy] ]]; then
-    INSTALL_BBR=true
-else
-    INSTALL_BBR=false
-fi
+INSTALL_BBR=false; [[ $ans_bbr =~ ^[Yy] ]] && INSTALL_BBR=true
 
 read -p "Настроить SSH ключ? (y/n): " ans_sshkey
-if [[ $ans_sshkey =~ ^[Yy] ]]; then
-    INSTALL_SSH_KEY=true
-else
-    INSTALL_SSH_KEY=false
-fi
+INSTALL_SSH_KEY=false; [[ $ans_sshkey =~ ^[Yy] ]] && INSTALL_SSH_KEY=true
 
 if [[ $EUID -ne 0 ]]; then
    error "Этот скрипт должен быть запущен с правами root"
@@ -95,15 +124,6 @@ while true; do
     read -p "Введите имя ноды (например, us-node-1): " NODE_NAME
     if [ -z "$NODE_NAME" ]; then
         warning "Имя ноды не может быть пустым. Пожалуйста, введите значение."
-    else
-        break
-    fi
-done
-
-while true; do
-    read -p "Введите deSEC API-токен: " DESEC_TOKEN
-    if [ -z "$DESEC_TOKEN" ]; then
-        warning "API-токен не может быть пустым. Пожалуйста, введите значение."
     else
         break
     fi
@@ -178,7 +198,6 @@ openssl dhparam -out /etc/nginx/dhparam.pem 2048 || error "Ошибка при �
 # acme.sh install/update
 log "Установка/обновление acme.sh..."
 curl https://get.acme.sh | sh || error "Ошибка при установке acme.sh"
-export DEDYN_TOKEN="${DESEC_TOKEN}"
 export LE_EMAIL="${LE_EMAIL}"
 export HOME="/root"
 . /root/.acme.sh/acme.sh.env
@@ -188,8 +207,8 @@ export HOME="/root"
 log "Регистрация аккаунта Let's Encrypt через acme.sh..."
 ~/.acme.sh/acme.sh --register-account -m "${LE_EMAIL}" --server letsencrypt || warning "Аккаунт LE уже зарегистрирован"
 
-log "Выпуск wildcard SSL для ${MAIN_DOMAIN} и *.${MAIN_DOMAIN} через deSEC..."
-~/.acme.sh/acme.sh --issue --dns dns_desec -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --keylength ec-256 --dnssleep 120 --force --home /root/.acme.sh || error "Не удалось получить wildcard сертификат через deSEC"
+log "Выпуск wildcard SSL для ${MAIN_DOMAIN} и *.${MAIN_DOMAIN} через $DNS_PROVIDER..."
+~/.acme.sh/acme.sh --issue --dns $DNS_API -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --keylength ec-256 --dnssleep 120 --force --home /root/.acme.sh || error "Не удалось получить wildcard сертификат через $DNS_PROVIDER"
 
 mkdir -p /etc/letsencrypt/live/${MAIN_DOMAIN}
 cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/${MAIN_DOMAIN}.key /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem
