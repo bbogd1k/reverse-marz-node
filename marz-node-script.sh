@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 clear
 echo -e "\033[1;31m"
@@ -26,6 +27,8 @@ log() { echo -e "${GREEN}[INFO]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 debug() { echo -e "[DEBUG] $1"; }
+
+trap 'error "Неожиданная ошибка на строке $LINENO"' ERR
 
 # ======================== Выбор DNS-провайдера ========================
 while true; do
@@ -64,6 +67,16 @@ while true; do
     fi
 done
 
+# ======================== Выбор протокола транспорта ========================
+while true; do
+    read -p "Выберите протокол транспорта для узла (xhttp/else) [else]: " TRANSPORT_PROTO
+    TRANSPORT_PROTO=${TRANSPORT_PROTO:-else}
+    case "$TRANSPORT_PROTO" in
+        xhttp) XHTTP_MODE=true;  break ;;
+        else)  XHTTP_MODE=false; break ;;
+        *) echo "Допустимые значения: xhttp или else";;
+    esac
+done
 
 # ======================== Параметры ========================
 read -p "Установить BBR и Xanmod Kernel? (y/n): " ans_bbr
@@ -132,7 +145,7 @@ done
 
 while true; do
     read -p "Введите email для Let's Encrypt (обязательно, не фейк): " LE_EMAIL
-    if [ -z "$LE_EMAIL" ]; then
+    if [ -з "$LE_EMAIL" ]; then
         warning "Email не может быть пустым. Пожалуйста, введите значение."
     else
         break
@@ -172,25 +185,31 @@ apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnup
 # ======================== Опциональная установка BBR ========================
 if $INSTALL_BBR; then
     log "Установка BBRv3..."
-    curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 > bbrv3.sh || error "Ошибка при скачивании BBRv3"
+    curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 > /root/bbrv3.sh || error "Ошибка при скачивании BBRv3"
+    chmod +x /root/bbrv3.sh
     expect << 'EOF'
-spawn bash bbrv3.sh
+spawn bash /root/bbrv3.sh
 expect "Enter"
 send "1\r"
 expect "y/n"
 send "y\r"
 expect eof
 EOF
-    rm bbrv3.sh
+    rm -f /root/bbrv3.sh
 else
     debug "BBR не устанавливается."
 fi
 
 log "Установка NGINX и acme.sh..."
-curl https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
-gpg --dry-run --quiet --no-keyring --import --import-options import-show /usr/share/keyrings/nginx-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" | tee /etc/apt/sources.list.d/nginx.list
-echo -e "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" | tee /etc/apt/preferences.d/99nginx
+curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
+gpg --dry-run --quiet --no-keyring --import --import-options import-show /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" | tee /etc/apt/sources.list.d/nginx.list >/dev/null
+cat >/etc/apt/preferences.d/99nginx <<'EOF'
+Package: *
+Pin: origin nginx.org
+Pin: release o=nginx
+Pin-Priority: 900
+EOF
 apt update 2>&1 | while read -r line; do debug "$line"; done
 apt install -y nginx || error "Ошибка при установке Nginx"
 mkdir -p /etc/nginx
@@ -198,7 +217,7 @@ openssl dhparam -out /etc/nginx/dhparam.pem 2048 || error "Ошибка при �
 
 # acme.sh install/update
 log "Установка/обновление acme.sh..."
-curl https://get.acme.sh | sh || error "Ошибка при установке acme.sh"
+curl -fsSL https://get.acme.sh | sh || error "Ошибка при установке acme.sh"
 export LE_EMAIL="${LE_EMAIL}"
 export HOME="/root"
 . /root/.acme.sh/acme.sh.env
@@ -216,9 +235,8 @@ cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/${MAIN_DOMAIN}.key /etc/letsencrypt/live/${
 cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/fullchain.cer /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem
 cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/ca.cer /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem
 
-log "Nginx конфиг..."
-mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup 2>/dev/null
-
+# ======================== Функции генерации конфигов Nginx ========================
+write_nginx_common_conf() {
 cat > /etc/nginx/nginx.conf << 'EOF'
 user www-data;
 pid /var/run/nginx.pid;
@@ -226,10 +244,12 @@ worker_processes auto;
 worker_rlimit_nofile 65535;
 error_log /var/log/nginx/error.log;
 include /etc/nginx/modules-enabled/*.conf;
+
 events {
     multi_accept on;
     worker_connections 1024;
 }
+
 http {
     map $request_uri $cleaned_request_uri {
         default $request_uri;
@@ -249,6 +269,7 @@ http {
     real_ip_header X-Forwarded-For;
     real_ip_recursive on;
     access_log /var/log/nginx/access.log json_analytics;
+
     sendfile on;
     tcp_nopush on;
     tcp_nodelay on;
@@ -260,8 +281,10 @@ http {
     keepalive_timeout 75s;
     keepalive_requests 1000;
     reset_timedout_connection on;
+
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
+
     ssl_session_timeout 1d;
     ssl_session_cache shared:SSL:1m;
     ssl_session_tickets off;
@@ -270,26 +293,43 @@ http {
     ssl_ciphers TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
     ssl_stapling on;
     ssl_stapling_verify on;
+
     resolver 127.0.0.1 valid=60s;
     resolver_timeout 2s;
+
     gzip on;
+
     add_header X-XSS-Protection "0" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "no-referrer-when-downgrade" always;
     add_header Permissions-Policy "interest-cohort=()" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
     add_header X-Frame-Options "SAMEORIGIN";
+
     proxy_hide_header X-Powered-By;
+
     include /etc/nginx/conf.d/*.conf;
 }
+
 stream {
     include /etc/nginx/stream-enabled/stream.conf;
 }
 EOF
+}
 
-mkdir -p /etc/nginx/stream-enabled
-rm -f /etc/nginx/conf.d/default.conf
+write_nginx_xhttp_stream_only() {
+    mkdir -p /etc/nginx/stream-enabled
+cat > /etc/nginx/stream-enabled/stream.conf << 'EOF'
+server {
+    listen 443 reuseport;
+    proxy_pass 127.0.0.1:5443;
+}
+EOF
+    rm -f /etc/nginx/conf.d/*.conf 2>/dev/null || true
+}
 
+write_nginx_else_with_site() {
+    mkdir -p /etc/nginx/stream-enabled
 cat > /etc/nginx/stream-enabled/stream.conf << EOF
 map \$ssl_preread_server_name \$backend {
     default block;
@@ -344,61 +384,65 @@ server {
 }
 EOF
 
-mkdir -p /var/www/${SUBDOMAIN}
+    mkdir -p /var/www/${SUBDOMAIN}
+    if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
 cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cloud Storage - Login</title>
-    <style>
-        body { font-family: Arial, sans-serif; background-color: #f5f5f5; margin: 0; padding: 0; display: flex; justify-content: center; align-items: center; height: 100vh; }
-        .login-container { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 0 20px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; }
-        .login-header { text-align: center; margin-bottom: 30px; }
-        .login-header h1 { color: #333; margin: 0; font-size: 24px; }
-        .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; margin-bottom: 5px; color: #666; }
-        .form-group input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-        .submit-btn { width: 100%; padding: 12px; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
-        .submit-btn:hover { background-color: #0056b3; }
-        .footer { text-align: center; margin-top: 20px; color: #666; font-size: 14px; }
-    </style>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cloud Storage - Login</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:0;display:flex;justify-content:center;align-items:center;height:100vh}
+.login-container{background:#fff;padding:40px;border-radius:10px;box-shadow:0 0 20px rgba(0,0,0,.1);width:100%;max-width:400px}
+.login-header{text-align:center;margin-bottom:30px}
+.login-header h1{color:#333;margin:0;font-size:24px}
+.form-group{margin-bottom:20px}
+.form-group label{display:block;margin-bottom:5px;color:#666}
+.form-group input{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
+.submit-btn{width:100%;padding:12px;background:#007bff;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:16px}
+.submit-btn:hover{background:#0056b3}
+.footer{text-align:center;margin-top:20px;color:#666;font-size:14px}
+</style>
 </head>
 <body>
-    <div class="login-container">
-        <div class="login-header">
-            <h1>Cloud Storage</h1>
-        </div>
-        <form action="#" method="POST" onsubmit="return false;">
-            <div class="form-group">
-                <label for="email">Email</label>
-                <input type="email" id="email" name="email" required>
-            </div>
-            <div class="form-group">
-                <label for="password">Password</label>
-                <input type="password" id="password" name="password" required>
-            </div>
-            <button type="submit" class="submit-btn">Log In</button>
-        </form>
-        <div class="footer">
-            <p>Protected by CloudFlare</p>
-        </div>
-    </div>
+<div class="login-container">
+  <div class="login-header"><h1>Cloud Storage</h1></div>
+  <form onsubmit="return false;">
+    <div class="form-group"><label>Email</label><input type="email" required></div>
+    <div class="form-group"><label>Password</label><input type="password" required></div>
+    <button class="submit-btn">Log In</button>
+  </form>
+  <div class="footer"><p>Protected by CloudFlare</p></div>
+</div>
 </body>
 </html>
 EOF
+    fi
+    chown -R www-data:www-data /var/www/${SUBDOMAIN}
+    chmod -R 755 /var/www/${SUBDOMAIN}
+}
 
-chown -R www-data:www-data /var/www/${SUBDOMAIN}
-chmod -R 755 /var/www/${SUBDOMAIN}
+# ======================== Генерация конфигов Nginx ========================
+log "Nginx конфиг..."
+mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup 2>/dev/null || true
+mkdir -p /etc/nginx/stream-enabled
+rm -f /etc/nginx/conf.d/default.conf 2>/dev/null || true
+
+write_nginx_common_conf
+if $XHTTP_MODE; then
+    write_nginx_xhttp_stream_only
+else
+    write_nginx_else_with_site
+fi
 
 # ======================== Установка Marzban Node ========================
 log "Установка Marzban Node..."
-curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh > marzban-node.sh
-chmod +x marzban-node.sh
+curl -fsSL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh > /root/marzban-node.sh
+chmod +x /root/marzban-node.sh
 
 expect << EOF
-spawn ./marzban-node.sh @ install --name ${NODE_NAME}
+spawn /root/marzban-node.sh @ install --name ${NODE_NAME}
 expect "Please paste the content of the Client Certificate"
 send -- "-----BEGIN CERTIFICATE-----\n"
 send -- "${CERT_BODY}\n"
@@ -412,7 +456,7 @@ send -- "${API_PORT}\n"
 expect eof
 EOF
 
-rm -f marzban-node.sh
+rm -f /root/marzban-node.sh
 
 mkdir -p /var/lib/marzban/log
 touch /var/lib/marzban/log/access.log
@@ -421,32 +465,51 @@ chmod 644 /var/lib/marzban/log/access.log
 
 DOCKER_COMPOSE_FILE="/opt/${NODE_NAME}/docker-compose.yml"
 if [[ -f "${DOCKER_COMPOSE_FILE}" ]]; then
-    sed -i '/volumes:/a\      - /var/lib/marzban/log:/var/lib/marzban/log' ${DOCKER_COMPOSE_FILE}
-    cd /opt/${NODE_NAME}
+    if ! grep -q "/var/lib/marzban/log" "${DOCKER_COMPOSE_FILE}"; then
+        sed -i '/volumes:/a\      - /var/lib/marzban/log:/var/lib/marzban/log' ${DOCKER_COMPOSE_FILE}
+    fi
+    # Привязка портов на loopback (без экспонирования наружу)
+    sed -i "s/['\"]\?${SERVICE_PORT}:\?${SERVICE_PORT}['\"]/\"127.0.0.1:${SERVICE_PORT}:${SERVICE_PORT}\"/g" ${DOCKER_COMPOSE_FILE}
+    sed -i "s/['\"]\?${API_PORT}:\?${API_PORT}['\"]/\"127.0.0.1:${API_PORT}:${API_PORT}\"/g" ${DOCKER_COMPOSE_FILE}
+
+    pushd /opt/${NODE_NAME} >/dev/null
     docker compose down
     docker compose up -d
+    popd >/dev/null
 else
-    warning "Файл docker-compose.yml не найден, пропуск настройки монтирования логов."
+    warning "Файл docker-compose.yml не найден, пропуск настройки монтирования логов и привязки портов."
 fi
 
+# ======================== Проверка Nginx ========================
 nginx -t 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка в конфигурации Nginx"
 systemctl enable nginx 2>&1 | while read -r line; do debug "$line"; done
-systemctl start nginx 2>&1 | while read -r line; do debug "$line"; done
+systemctl restart nginx 2>&1 | while read -r line; do debug "$line"; done
 if ! systemctl is-active --quiet nginx; then
     error "Не удалось запустить Nginx"
 fi
 
+# ======================== UFW ========================
 log "Настройка UFW..."
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow 80/tcp
-ufw allow 443/tcp
+
 ufw allow ${SSH_PORT}/tcp
+ufw allow 443/tcp
 ufw allow from ${MASTER_IP}
+
+if $XHTTP_MODE; then
+    # Ничего дополнительно не открываем: 80/9090/5443 не нужны наружу
+    :
+else
+    ufw allow 80/tcp
+    ufw allow 9090/tcp
+fi
+
 echo "y" | ufw enable
 ufw status verbose || error "Ошибка при настройке UFW"
 
+# ======================== SSH ========================
 log "Настройка SSH..."
 if $INSTALL_SSH_KEY; then
     mkdir -p /root/.ssh
@@ -472,12 +535,20 @@ EOF
     if ! systemctl is-active --quiet ssh; then
         error "Не удалось запустить SSH"
     fi
+else
+    # Если ключ не настраиваем, всё равно применим порт
+    if ! grep -q "^Port " /etc/ssh/sshd_config; then
+        sed -i "1i Port ${SSH_PORT}" /etc/ssh/sshd_config
+    else
+        sed -i "s/^Port .*/Port ${SSH_PORT}/" /etc/ssh/sshd_config
+    fi
+    systemctl restart ssh || true
 fi
 
 log "Установка успешно завершена!"
 debug "Все компоненты установлены и настроены"
 read -p "Перезагрузить систему сейчас? (y/n): " reboot_now
-if [[ $reboot_now == "y" ]]; then
+if [[ $reboot_now == "y" || $reboot_now == "Y" ]]; then
     debug "Выполняется перезагрузка системы..."
     reboot
 fi
