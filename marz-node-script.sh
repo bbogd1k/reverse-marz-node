@@ -41,11 +41,8 @@ while true; do
         DNS_API="dns_desec"
         while true; do
             read -p "Введите deSEC API-токен: " DNS_TOKEN
-            if [ -z "$DNS_TOKEN" ]; then
-                warning "Токен не может быть пустым."
-            else
-                break
-            fi
+            [[ -z "$DNS_TOKEN" ]] && { warning "Токен не может быть пустым."; continue; }
+            break
         done
         export DEDYN_TOKEN="$DNS_TOKEN"
         break
@@ -54,11 +51,8 @@ while true; do
         DNS_API="dns_gcore"
         while true; do
             read -p "Введите Gcore API-ключ (поле API Key из Gcore, права на DNS): " DNS_TOKEN
-            if [ -z "$DNS_TOKEN" ]; then
-                warning "Ключ не может быть пустым."
-            else
-                break
-            fi
+            [[ -z "$DNS_TOKEN" ]] && { warning "Ключ не может быть пустым."; continue; }
+            break
         done
         export GCORE_Key="$DNS_TOKEN"
         break
@@ -145,7 +139,7 @@ done
 
 while true; do
     read -p "Введите email для Let's Encrypt (обязательно, не фейк): " LE_EMAIL
-    if [ -з "$LE_EMAIL" ]; then
+    if [ -z "$LE_EMAIL" ]; then
         warning "Email не может быть пустым. Пожалуйста, введите значение."
     else
         break
@@ -156,6 +150,16 @@ read -p "Введите порт для сервиса (по умолчанию 
 SERVICE_PORT=${SERVICE_PORT:-62050}
 read -p "Введите порт для API (по умолчанию 62051): " API_PORT
 API_PORT=${API_PORT:-62051}
+
+if $XHTTP_MODE; then
+    echo
+    echo "Укажи домены, которые должны идти в XHTTP (через пробел)."
+    echo "Например: login.vpnabe.online x.vpnabe.online sp1.zvng.ru"
+    echo "Если оставить пустым — XHTTP-роутинг по 443 будет только для явно указанных позже (по умолчанию всё, кроме ${SUBDOMAIN}, попадёт в блок)."
+    read -r XHTTP_SNI_LINE || true
+    # нормализуем в массив
+    read -ra XHTTP_SNI <<< "${XHTTP_SNI_LINE:-}"
+fi
 
 log "Введите SSL client сертификат (После Enter - Ctrl+D для завершения ввода):"
 SSL_CERT=$(cat)
@@ -317,15 +321,95 @@ stream {
 EOF
 }
 
-write_nginx_xhttp_stream_only() {
+write_nginx_xhttp_with_stub() {
     mkdir -p /etc/nginx/stream-enabled
-cat > /etc/nginx/stream-enabled/stream.conf << 'EOF'
+
+    # Соберём map динамически: ${SUBDOMAIN} -> web; XHTTP_SNI[*] -> xhttp; default -> block
+    {
+        echo 'map $ssl_preread_server_name $backend {'
+        echo '    default block;'
+        echo "    ${SUBDOMAIN} web;"
+        if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
+            for d in "${XHTTP_SNI[@]}"; do
+                [[ -n "$d" ]] && echo "    ${d} xhttp;"
+            done
+        fi
+        echo '}'
+        echo
+        echo 'upstream block {'
+        echo '    server 127.0.0.1:36076;'
+        echo '}'
+        echo 'upstream xhttp {'
+        echo '    server 127.0.0.1:5443;'
+        echo '}'
+        echo 'upstream web {'
+        echo '    server 127.0.0.1:36077;'
+        echo '}'
+        echo 'server {'
+        echo '    listen 443 reuseport;'
+        echo '    ssl_preread on;'
+        echo '    proxy_protocol on;'
+        echo '    proxy_pass $backend;'
+        echo '}'
+    } > /etc/nginx/stream-enabled/stream.conf
+
+cat > /etc/nginx/conf.d/local.conf << EOF
 server {
-    listen 443 reuseport;
-    proxy_pass 127.0.0.1:5443;
+    listen 80;
+    server_name ${SUBDOMAIN};
+    location / {
+        return 301 https://${SUBDOMAIN}\$request_uri;
+    }
+}
+
+# Upstream "block": принудительный reject для лишних SNI
+server {
+    listen 36076 ssl proxy_protocol;
+    ssl_reject_handshake on;
+}
+
+# Upstream "web": реальная заглушка HTTPS на 36077
+server {
+    listen 36077 ssl proxy_protocol http2;
+    server_name ${SUBDOMAIN};
+    ssl_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
+    ssl_dhparam /etc/nginx/dhparam.pem;
+
+    index index.html;
+    root /var/www/${SUBDOMAIN}/;
 }
 EOF
-    rm -f /etc/nginx/conf.d/*.conf 2>/dev/null || true
+
+    mkdir -p /var/www/${SUBDOMAIN}
+    if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
+cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Service is up</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;background:#0f1220;color:#e6e6e6;margin:0;display:flex;justify-content:center;align-items:center;height:100vh}
+.card{background:#171a2a;border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.4);padding:28px;max-width:520px;text-align:center}
+h1{font-size:28px;margin:0 0 10px}
+p{opacity:.9;line-height:1.5}
+small{opacity:.6}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>elite.vzroslie.ru</h1>
+  <p>Узел онлайн. Это техническая заглушка для проверки доступности домена и TLS.</p>
+  <small>© VPNation</small>
+</div>
+</body>
+</html>
+EOF
+    fi
+    chown -R www-data:www-data /var/www/${SUBDOMAIN}
+    chmod -R 755 /var/www/${SUBDOMAIN}
 }
 
 write_nginx_else_with_site() {
@@ -388,7 +472,7 @@ EOF
     if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
 cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cloud Storage - Login</title>
@@ -431,7 +515,7 @@ rm -f /etc/nginx/conf.d/default.conf 2>/dev/null || true
 
 write_nginx_common_conf
 if $XHTTP_MODE; then
-    write_nginx_xhttp_stream_only
+    write_nginx_xhttp_with_stub
 else
     write_nginx_else_with_site
 fi
@@ -451,104 +535,4 @@ expect "Do you want to use REST protocol?"
 send -- "y\n"
 expect "Enter the SERVICE_PORT"
 send -- "${SERVICE_PORT}\n"
-expect "Enter the XRAY_API_PORT"
-send -- "${API_PORT}\n"
-expect eof
-EOF
-
-rm -f /root/marzban-node.sh
-
-mkdir -p /var/lib/marzban/log
-touch /var/lib/marzban/log/access.log
-chmod 755 /var/lib/marzban/log
-chmod 644 /var/lib/marzban/log/access.log
-
-DOCKER_COMPOSE_FILE="/opt/${NODE_NAME}/docker-compose.yml"
-if [[ -f "${DOCKER_COMPOSE_FILE}" ]]; then
-    if ! grep -q "/var/lib/marzban/log" "${DOCKER_COMPOSE_FILE}"; then
-        sed -i '/volumes:/a\      - /var/lib/marzban/log:/var/lib/marzban/log' ${DOCKER_COMPOSE_FILE}
-    fi
-    # Привязка портов на loopback (без экспонирования наружу)
-    sed -i "s/['\"]\?${SERVICE_PORT}:\?${SERVICE_PORT}['\"]/\"127.0.0.1:${SERVICE_PORT}:${SERVICE_PORT}\"/g" ${DOCKER_COMPOSE_FILE}
-    sed -i "s/['\"]\?${API_PORT}:\?${API_PORT}['\"]/\"127.0.0.1:${API_PORT}:${API_PORT}\"/g" ${DOCKER_COMPOSE_FILE}
-
-    pushd /opt/${NODE_NAME} >/dev/null
-    docker compose down
-    docker compose up -d
-    popd >/dev/null
-else
-    warning "Файл docker-compose.yml не найден, пропуск настройки монтирования логов и привязки портов."
-fi
-
-# ======================== Проверка Nginx ========================
-nginx -t 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка в конфигурации Nginx"
-systemctl enable nginx 2>&1 | while read -r line; do debug "$line"; done
-systemctl restart nginx 2>&1 | while read -r line; do debug "$line"; done
-if ! systemctl is-active --quiet nginx; then
-    error "Не удалось запустить Nginx"
-fi
-
-# ======================== UFW ========================
-log "Настройка UFW..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-
-ufw allow ${SSH_PORT}/tcp
-ufw allow 443/tcp
-ufw allow from ${MASTER_IP}
-
-if $XHTTP_MODE; then
-    # Ничего дополнительно не открываем: 80/9090/5443 не нужны наружу
-    :
-else
-    ufw allow 80/tcp
-    ufw allow 9090/tcp
-fi
-
-echo "y" | ufw enable
-ufw status verbose || error "Ошибка при настройке UFW"
-
-# ======================== SSH ========================
-log "Настройка SSH..."
-if $INSTALL_SSH_KEY; then
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-    cat > /root/.ssh/authorized_keys << EOF
-${SSH_KEY}
-EOF
-
-    cat > /etc/ssh/sshd_config << EOF
-Port ${SSH_PORT}
-Protocol 2
-PermitRootLogin prohibit-password
-PasswordAuthentication no
-PubkeyAuthentication yes
-PermitEmptyPasswords no
-X11Forwarding no
-MaxAuthTries 3
-LoginGraceTime 60
-AllowUsers root
-EOF
-
-    systemctl restart ssh
-    if ! systemctl is-active --quiet ssh; then
-        error "Не удалось запустить SSH"
-    fi
-else
-    # Если ключ не настраиваем, всё равно применим порт
-    if ! grep -q "^Port " /etc/ssh/sshd_config; then
-        sed -i "1i Port ${SSH_PORT}" /etc/ssh/sshd_config
-    else
-        sed -i "s/^Port .*/Port ${SSH_PORT}/" /etc/ssh/sshd_config
-    fi
-    systemctl restart ssh || true
-fi
-
-log "Установка успешно завершена!"
-debug "Все компоненты установлены и настроены"
-read -p "Перезагрузить систему сейчас? (y/n): " reboot_now
-if [[ $reboot_now == "y" || $reboot_now == "Y" ]]; then
-    debug "Выполняется перезагрузка системы..."
-    reboot
-fi
+expect "Enter the
