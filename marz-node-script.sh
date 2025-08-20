@@ -180,13 +180,24 @@ curl -fsSL https://get.acme.sh | sh
 log "Выпуск wildcard для ${MAIN_DOMAIN} (+ *.${MAIN_DOMAIN}) через ${DNS_PROVIDER}..."
 ~/.acme.sh/acme.sh --issue --dns ${DNS_API} -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --keylength ec-256 --dnssleep 120 --force
 
+cat >/usr/local/sbin/nginx-acme-reload.sh <<'SH'
+#!/usr/bin/env bash
+set -e
+if systemctl is-active --quiet nginx; then
+  nginx -t && systemctl reload nginx
+else
+  echo "[acme] nginx inactive, skip reload"
+fi
+SH
+chmod +x /usr/local/sbin/nginx-acme-reload.sh
+
 log "Деплой сертификатов в боевые пути + auto-reload nginx при продлении..."
 mkdir -p /etc/letsencrypt/live/${MAIN_DOMAIN}
 ~/.acme.sh/acme.sh --install-cert -d "${MAIN_DOMAIN}" --ecc \
   --key-file       "/etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem" \
   --fullchain-file "/etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem" \
   --ca-file        "/etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem" \
-  --reloadcmd      "systemctl reload nginx"
+  --reloadcmd      "/usr/local/sbin/nginx-acme-reload.sh"
 
 # ==================== NGINX конфиги ====================
 write_nginx_common_conf() {
