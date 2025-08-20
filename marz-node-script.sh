@@ -116,6 +116,40 @@ if $XHTTP_MODE; then
   read -ra XHTTP_SNI <<< "${XHTTP_SNI_LINE:-}"
 fi
 
+# Требования: домен != SUBDOMAIN, валидный формат, без дубликатов, нижний регистр
+read -ra XHTTP_RAW <<< "${XHTTP_SNI_LINE:-}"
+
+declare -A __seen
+XHTTP_SNI=()
+
+is_valid_domain() {
+  [[ "$1" =~ ^([a-z0-9-]+\.)+[a-z0-9-]+$ ]]
+}
+
+for d in "${XHTTP_RAW[@]}"; do
+  d=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')
+  d="${d%.}"                         # уберём завершающую точку, если была
+  [[ -z "$d" ]] && continue
+
+  if [[ "$d" == "$SUBDOMAIN" ]]; then
+    warning "Домены для xhttp не могут совпадать с доменом заглушки (${SUBDOMAIN}). '${d}' исключён."
+    continue
+  fi
+  if ! is_valid_domain "$d"; then
+    warning "Пропускаю некорректный домен для xhttp: ${d}"
+    continue
+  fi
+  if [[ -z "${__seen[$d]:-}" ]]; then
+    __seen[$d]=1
+    XHTTP_SNI+=("$d")
+  fi
+done
+
+if [[ ${#XHTTP_SNI[@]} -eq 0 ]]; then
+  warning "Список xhttp-доменов пуст. xhttp будет работать только по явно разрешённым SNI (если добавишь позже)."
+fi
+
+
 log "Вставьте SSL client сертификат (после Enter нажмите Ctrl+D):"
 SSL_CERT=$(cat)
 [[ -z "$SSL_CERT" ]] && err "Сертификат пустой"
@@ -248,31 +282,36 @@ stream { include /etc/nginx/stream-enabled/stream.conf; }
 EOF
 }
 
-# xHTTP + заглушка, БЕЗ proxy_protocol
 write_nginx_xhttp_with_stub() {
   mkdir -p /etc/nginx/stream-enabled
 
+  # stream: SNI-роутинг без proxy_protocol
   {
     echo 'map $ssl_preread_server_name $backend {'
     echo '    default block;'
+    # заглушка всегда на SUBDOMAIN → web
     echo "    ${SUBDOMAIN} web;"
+    # каждый валидный SNI из списка → xhttp (SUBDOMAIN здесь уже исключён на этапе sanitize)
     if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
       for d in "${XHTTP_SNI[@]}"; do
-        [ -n "$d" ] && echo "    ${d} xhttp;"
+        echo "    ${d} xhttp;"
       done
     fi
     echo '}'
+
     echo
-    echo 'upstream block { server 127.0.0.1:36076; }'
-    echo 'upstream xhttp { server 127.0.0.1:5443; }'
-    echo 'upstream web   { server 127.0.0.1:36077; }'
+    echo 'upstream block { server 127.0.0.1:36076; }' # ssl_reject_handshake
+    echo 'upstream xhttp { server 127.0.0.1:5443; }' # XRAY REALITY XHTTP
+    echo 'upstream web   { server 127.0.0.1:36077; }' # HTTPS-заглушка
+
     echo 'server {'
-    echo '  listen 443 reuseport;'
-    echo '  ssl_preread on;'
-    echo '  proxy_pass $backend;'
+    echo '    listen 443 reuseport;'
+    echo '    ssl_preread on;'
+    echo '    proxy_pass $backend;'
     echo '}'
   } > /etc/nginx/stream-enabled/stream.conf
 
+  # http: заглушка (web) и жёсткий reject (block)
   cat > /etc/nginx/conf.d/local.conf <<EOF
 server {
   listen 80;
@@ -295,22 +334,27 @@ server {
 }
 EOF
 
-  mkdir -p /var/www/${SUBDOMAIN}
-  if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
-    cat > /var/www/${SUBDOMAIN}/index.html <<'EOF'
-<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Service is up</title><style>
-body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}
-main{min-height:100vh;display:grid;place-items:center;background:#0b1220;color:#e6edf3}
-.card{background:#111827;border:1px solid #243244;border-radius:16px;padding:28px 32px;max-width:640px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
-h1{margin:0 0 10px;font-size:24px}p{margin:0;color:#9fb0c3}
-</style></head><body><main><div class="card">
-<h1>Узел активен</h1><p>Техническая заглушка HTTPS. TLS работает.</p>
-</div></main></body></html>
+  # http: РЕДИРЕКТЫ ДЛЯ КАЖДОГО xhttp-домена НА ЗАГЛУШКУ (80→HTTPS SUBDOMAIN)
+  : > /etc/nginx/conf.d/xhttp-redirects.conf
+  if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
+    for d in "${XHTTP_SNI[@]}"; do
+      cat >> /etc/nginx/conf.d/xhttp-redirects.conf <<EOF
+server {
+  listen 80;
+  server_name ${d};
+  location / { return 301 https://${SUBDOMAIN}\$request_uri; }
+}
 EOF
+    done
   fi
-  chown -R www-data:www-data /var/www/${SUBDOMAIN}; chmod -R 755 /var/www/${SUBDOMAIN}
+
+  # контент заглушки (ровно тот, что ты хотел)
+  mkdir -p /var/www/${SUBDOMAIN}
+  cat > /var/www/${SUBDOMAIN}/index.html <<'EOF'
+<!DOCTYPE html> <html lang="en"> <head> <meta charset="UTF-8"> <meta name="viewport" content="width=device-width, initial-scale=1.0"> <title>Cloud Storage - Login</title> <style> body { font-family: Arial, sans-serif; background-color: #f5f5f5; margin: 0; padding: 0; display: flex; justify-content: center; align-items: center; height: 100vh; } .login-container { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 0 20px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; } .login-header { text-align: center; margin-bottom: 30px; } .login-header h1 { color: #333; margin: 0; font-size: 24px; } .form-group { margin-bottom: 20px; } .form-group label { display: block; margin-bottom: 5px; color: #666; } .form-group input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; } .submit-btn { width: 100%; padding: 12px; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; } .submit-btn:hover { background-color: #0056b3; } .footer { text-align: center; margin-top: 20px; color: #666; font-size: 14px; } </style> </head> <body> <div class="login-container"> <div class="login-header"> <h1>Cloud Storage</h1> </div> <form action="#" method="POST" onsubmit="return false;"> <div class="form-group"> <label for="email">Email</label> <input type="email" id="email" name="email" required> </div> <div class="form-group"> <label for="password">Password</label> <input type="password" id="password" name="password" required> </div> <button type="submit" class="submit-btn">Log In</button> </form> <div class="footer"> <p>Protected by CloudFlare</p> </div> </div> </body> </html>
+EOF
+  chown -R www-data:www-data /var/www/${SUBDOMAIN}
+  chmod -R 755 /var/www/${SUBDOMAIN}
 }
 
 # «else»-режим (ваша прежняя схема, без proxy_protocol для совместимости)
@@ -358,11 +402,12 @@ server {
 }
 EOF
 
-  mkdir -p /var/www/${SUBDOMAIN}
-  if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
-    echo "<h1>Cloud Storage</h1>" > /var/www/${SUBDOMAIN}/index.html
-  fi
-  chown -R www-data:www-data /var/www/${SUBDOMAIN}; chmod -R 755 /var/www/${SUBDOMAIN}
+mkdir -p /var/www/${SUBDOMAIN}
+cat > /var/www/${SUBDOMAIN}/index.html <<'EOF'
+<!DOCTYPE html> <html lang="en"> <head> <meta charset="UTF-8"> <meta name="viewport" content="width=device-width, initial-scale=1.0"> <title>Cloud Storage - Login</title> <style> body { font-family: Arial, sans-serif; background-color: #f5f5f5; margin: 0; padding: 0; display: flex; justify-content: center; align-items: center; height: 100vh; } .login-container { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 0 20px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; } .login-header { text-align: center; margin-bottom: 30px; } .login-header h1 { color: #333; margin: 0; font-size: 24px; } .form-group { margin-bottom: 20px; } .form-group label { display: block; margin-bottom: 5px; color: #666; } .form-group input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; } .submit-btn { width: 100%; padding: 12px; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; } .submit-btn:hover { background-color: #0056b3; } .footer { text-align: center; margin-top: 20px; color: #666; font-size: 14px; } </style> </head> <body> <div class="login-container"> <div class="login-header"> <h1>Cloud Storage</h1> </div> <form action="#" method="POST" onsubmit="return false;"> <div class="form-group"> <label for="email">Email</label> <input type="email" id="email" name="email" required> </div> <div class="form-group"> <label for="password">Password</label> <input type="password" id="password" name="password" required> </div> <button type="submit" class="submit-btn">Log In</button> </form> <div class="footer"> <p>Protected by CloudFlare</p> </div> </div> </body> </html>
+EOF
+chown -R www-data:www-data /var/www/${SUBDOMAIN}
+chmod -R 755 /var/www/${SUBDOMAIN}
 }
 
 # Применяем
