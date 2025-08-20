@@ -28,6 +28,26 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 debug() { echo -e "[DEBUG] $1"; }
 
+# если нет debug(), делаем no-op с меткой
+if ! declare -F debug >/dev/null 2>&1; then
+  debug(){ echo -e "[DEBUG] $*"; }
+fi
+# выравниваем warn/warning
+if ! declare -F warn >/dev/null 2>&1; then
+  warn(){ echo -e "${YELLOW:-}[WARNING]${NC:-} $*"; }
+fi
+if ! declare -F warning >/dev/null 2>&1; then
+  warning(){ warn "$@"; }
+fi
+# выравниваем error/err (что бы ни было — оба работают)
+if ! declare -F error >/dev/null 2>&1; then
+  if declare -F err >/dev/null 2>&1; then
+    error(){ err "$@"; }
+  else
+    error(){ echo -e "${RED:-}[ERROR]${NC:-} $*"; exit 1; }
+  fi
+fi
+
 trap 'error "Неожиданная ошибка на строке $LINENO"' ERR
 
 # ======================== Выбор DNS-провайдера ========================
@@ -154,7 +174,6 @@ API_PORT=${API_PORT:-62051}
 if $XHTTP_MODE; then
     echo
     echo "Укажи домены, которые должны идти в XHTTP (через пробел)."
-    echo "Например: login.vpnabe.online x.vpnabe.online sp1.zvng.ru"
     echo "Если оставить пустым — XHTTP-роутинг по 443 будет только для явно указанных позже (по умолчанию всё, кроме ${SUBDOMAIN}, попадёт в блок)."
     read -r XHTTP_SNI_LINE || true
     # нормализуем в массив
