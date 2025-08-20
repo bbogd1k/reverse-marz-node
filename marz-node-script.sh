@@ -133,24 +133,34 @@ apt upgrade -y 2>&1 | while read -r l; do dbg "$l"; done
 apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat cron 2>&1 | while read -r l; do dbg "$l"; done
 systemctl enable --now cron
 
-# ==================== BBR ====================
-if $INSTALL_BBR; then
-  log "Установка BBRv3..."
-  curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 -o /root/bbrv3.sh || err "Не скачал bbrv3.sh"
-  chmod +x /root/bbrv3.sh
-  expect <<'EOF'
+# ======== УСТАНОВКА BBRv3 (устойчивый expect) ========
+log "Установка BBRv3..."
+curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 -o /root/bbrv3.sh || err "Не скачал bbrv3.sh"
+chmod +x /root/bbrv3.sh
+
+# Сторож, чтобы не висело бесконечно (15 минут хватит с запасом)
+timeout 900s expect <<'EOF' || { warn "Автоматизация BBR истекла по таймауту — попробуйте вручную: bash /root/bbrv3.sh"; }
 set timeout -1
+log_user 1
 spawn bash /root/bbrv3.sh
-expect "Enter"
-send "1\r"
-expect -re "(y/n|Y/n)"
-send "y\r"
-expect eof
+
+# Главное меню
+expect {
+    -re {Select an option:\s*} { send -- "1\r" }
+    timeout { exit 1 }
+}
+
+# Подтверждения установки / зависимостей / grub
+# Скрипт OPIran любит разные формулировки; ловим типовые варианты и отвечаем "y" либо Enter.
+expect {
+    -re {(Proceed|Do you want|Continue|press y/n).*\(.*[Yy].*/?.*[Nn].*\)} { send -- "y\r"; exp_continue }
+    -re {Press .* to continue}                                             { send -- "\r";  exp_continue }
+    -re {Hit:|Get:|Setting up|Unpacking|Preparing}                         { exp_continue }  ;# шум apt
+    eof
+}
 EOF
-  rm -f /root/bbrv3.sh
-else
-  dbg "BBR не ставим."
-fi
+
+rm -f /root/bbrv3.sh
 
 # ==================== NGINX ====================
 log "Установка NGINX..."
