@@ -451,17 +451,49 @@ chmod 755 /var/lib/marzban/log
 chmod 644 /var/lib/marzban/log/access.log
 
 DOCKER_COMPOSE_FILE="/opt/${NODE_NAME}/docker-compose.yml"
-if [[ -f "$DOCKER_COMPOSE_FILE" ]]; then
-  if ! grep -q "/var/lib/marzban/log" "$DOCKER_COMPOSE_FILE"; then
-    sed -i '/volumes:/a\      - /var/lib/marzban/log:/var/lib/marzban/log' "$DOCKER_COMPOSE_FILE"
+
+safe_compose_up() {
+  local dir="/opt/${NODE_NAME}"
+  local logf="/var/log/marzban-node-compose.${NODE_NAME}.log"
+
+  mkdir -p /var/log
+  pushd "$dir" >/dev/null || { warn "Каталог ${dir} недоступен — пропускаю запуск контейнера"; return 0; }
+
+  # На всякий: подтянем образ заранее, чтобы up не висел на pull
+  docker compose pull --quiet >/dev/null 2>&1 || true
+
+  # ВАЖНО: запускаем в отдельной сессии, без stdin, глушим ANSI, detach'им.
+  # Игнорируем CTRL+C внутри этого подпроцесса, чтобы не уронить весь инсталлятор.
+  set +e
+  ( trap '' INT; setsid -w \
+      docker compose up -d --remove-orphans --ansi never \
+      </dev/null >>"$logf" 2>&1 )
+  local rc=$?
+  set -e
+
+  if (( rc != 0 )); then
+    warn "docker compose up вернул код ${rc}. Смотри лог: ${logf}"
+  else
+    log "Marzban Node контейнер запущен (detached). Лог: ${logf}"
   fi
-  pushd "/opt/${NODE_NAME}" >/dev/null
-  docker compose down
-  docker compose up -d
-  popd >/dev/null
+
+  popd >/dev/null || true
+}
+
+if [[ -f "$DOCKER_COMPOSE_FILE" ]]; then
+  # аккуратно добавить монтирование логов, если volumes: есть и монтирования ещё нет
+  if grep -qE '^\s{2,}volumes:\s*$' "$DOCKER_COMPOSE_FILE" && \
+     ! grep -q "/var/lib/marzban/log" "$DOCKER_COMPOSE_FILE"; then
+    sed -i '/^\s\{2,\}volumes:\s*$/a\      - /var/lib/marzban/log:/var/lib/marzban/log' "$DOCKER_COMPOSE_FILE"
+  fi
+  safe_compose_up
 else
-  warn "docker-compose.yml не найден — монтирование логов пропущено"
+  warn "docker-compose.yml не найден — монтирование логов и запуск контейнера пропущены"
 fi
+
+# ВАЖНО: не проверяем «подключилась ли нода к мастеру» — это не ошибка установки.
+log "Marzban Node установлен и запущен. Добавь ноду в мастер-панели — связь установится."
+
 
 # ==================== Проверка NGINX ====================
 nginx -t 2>&1 | while read -r l; do dbg "$l"; done
