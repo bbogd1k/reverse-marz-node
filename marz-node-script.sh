@@ -16,523 +16,446 @@ cat << "EOF"
                                \_/__/                                                          
 EOF
 echo -e "\033[0m"
-echo ""
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log(){ echo -e "${GREEN}[INFO]${NC} $1"; }
+err(){ echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+warn(){ echo -e "${YELLOW}[WARNING]${NC} $1"; }
+dbg(){ echo -e "[DEBUG] $1"; }
+trap 'err "Неожиданная ошибка на строке $LINENO"' ERR
 
-log() { echo -e "${GREEN}[INFO]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
-warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-debug() { echo -e "[DEBUG] $1"; }
-
-trap 'error "Неожиданная ошибка на строке $LINENO"' ERR
-
-# ======================== Выбор DNS-провайдера ========================
+# ==================== DNS-провайдер для ACME ====================
 while true; do
-    echo -e "${YELLOW}Выберите DNS-провайдера для выпуска wildcard сертификата:"
-    echo "1) deSEC.io"
-    echo "2) Gcore DNS"
-    read -p "Введите номер (1 или 2): " DNS_PROVIDER_NUM
-    if [[ "$DNS_PROVIDER_NUM" == "1" ]]; then
-        DNS_PROVIDER="desec"
-        DNS_API="dns_desec"
-        while true; do
-            read -p "Введите deSEC API-токен: " DNS_TOKEN
-            [[ -z "$DNS_TOKEN" ]] && { warning "Токен не может быть пустым."; continue; }
-            break
-        done
-        export DEDYN_TOKEN="$DNS_TOKEN"
-        break
-    elif [[ "$DNS_PROVIDER_NUM" == "2" ]]; then
-        DNS_PROVIDER="gcore"
-        DNS_API="dns_gcore"
-        while true; do
-            read -p "Введите Gcore API-ключ (поле API Key из Gcore, права на DNS): " DNS_TOKEN
-            [[ -z "$DNS_TOKEN" ]] && { warning "Ключ не может быть пустым."; continue; }
-            break
-        done
-        export GCORE_Key="$DNS_TOKEN"
-        break
-    else
-        warning "Только 1 (deSEC.io) или 2 (Gcore DNS)"
-    fi
+  echo -e "${YELLOW}DNS-провайдер для выпуска wildcard-серта:${NC}"
+  echo "  1) deSEC.io"
+  echo "  2) Gcore DNS"
+  read -p "Введите номер (1/2): " DNS_PROVIDER_NUM
+  case "$DNS_PROVIDER_NUM" in
+    1)
+      DNS_PROVIDER="desec"; DNS_API="dns_desec"
+      while true; do
+        read -p "Введите deSEC API-токен: " DNS_TOKEN
+        [[ -z "$DNS_TOKEN" ]] && { warn "Токен пустой"; continue; }
+        export DEDYN_TOKEN="$DNS_TOKEN"; break
+      done
+      break
+      ;;
+    2)
+      DNS_PROVIDER="gcore"; DNS_API="dns_gcore"
+      while true; do
+        read -p "Введите Gcore API Key (права на DNS): " DNS_TOKEN
+        [[ -z "$DNS_TOKEN" ]] && { warn "Ключ пустой"; continue; }
+        export GCORE_Key="$DNS_TOKEN"; break
+      done
+      break
+      ;;
+    *) warn "Только 1 или 2";;
+  esac
 done
 
-# ======================== Выбор протокола транспорта ========================
+# ==================== Выбор транспорта ====================
 while true; do
-    read -p "Выберите протокол транспорта для узла (xhttp/else) [else]: " TRANSPORT_PROTO
-    TRANSPORT_PROTO=${TRANSPORT_PROTO:-else}
-    case "$TRANSPORT_PROTO" in
-        xhttp) XHTTP_MODE=true;  break ;;
-        else)  XHTTP_MODE=false; break ;;
-        *) echo "Допустимые значения: xhttp или else";;
-    esac
+  read -p "Выберите транспорт (xhttp/else) [else]: " TRANSPORT_PROTO
+  TRANSPORT_PROTO=${TRANSPORT_PROTO:-else}
+  case "$TRANSPORT_PROTO" in
+    xhttp) XHTTP_MODE=true; break;;
+    else)  XHTTP_MODE=false; break;;
+    *) echo "Доступно: xhttp или else";;
+  esac
 done
 
-# ======================== Параметры ========================
-read -p "Установить BBR и Xanmod Kernel? (y/n): " ans_bbr
-INSTALL_BBR=false; [[ $ans_bbr =~ ^[Yy] ]] && INSTALL_BBR=true
+# ==================== Параметры ====================
+read -p "Установить BBR и Xanmod Kernel? (y/n): " a_bbr
+INSTALL_BBR=false; [[ $a_bbr =~ ^[Yy]$ ]] && INSTALL_BBR=true
 
-read -p "Настроить SSH ключ? (y/n): " ans_sshkey
-INSTALL_SSH_KEY=false; [[ $ans_sshkey =~ ^[Yy] ]] && INSTALL_SSH_KEY=true
+read -p "Настроить SSH ключ? (y/n): " a_key
+INSTALL_SSH_KEY=false; [[ $a_key =~ ^[Yy]$ ]] && INSTALL_SSH_KEY=true
 
-if [[ $EUID -ne 0 ]]; then
-   error "Этот скрипт должен быть запущен с правами root"
-fi
+[[ $EUID -ne 0 ]] && err "Запустите с root"
 
-log "==================== НАЧАЛО УСТАНОВКИ ===================="
-log "Этап 0: Сбор необходимых данных..."
-
-while true; do
-    read -p "Введите порт для SSH (по умолчанию 22): " SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
-    if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
-        break
-    else
-        warning "Некорректный порт. Введите число от 1 до 65535"
-    fi
-done
+log "=== Сбор параметров ==="
+read -p "SSH порт [22]: " SSH_PORT; SSH_PORT=${SSH_PORT:-22}
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT<1 || SSH_PORT>65535 )); then err "Неверный SSH порт"; fi
 
 while true; do
-    read -p "Введите IP адрес мастер-ноды: " MASTER_IP
-    if [[ $MASTER_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        break
-    else
-        warning "Некорректный формат IP адреса. Попробуйте снова."
-    fi
+  read -p "IP мастер-ноды (доступ к REST/API): " MASTER_IP
+  [[ $MASTER_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break || warn "Неверный IPv4"
 done
 
 if $INSTALL_SSH_KEY; then
-    while true; do
-        log "Введите ваш публичный SSH ключ (должен начинаться с 'ssh-rsa' или 'ssh-ed25519'):"
-        read SSH_KEY
-        if [[ -z "$SSH_KEY" ]]; then
-            warning "SSH ключ не может быть пустым."
-        elif [[ "$SSH_KEY" =~ ^(ssh-rsa|ssh-ed25519)[[:space:]].*$ ]]; then
-            break
-        else
-            warning "Некорректный формат SSH ключа."
-        fi
-    done
+  while true; do
+    log "Вставьте публичный SSH ключ (ssh-rsa/ssh-ed25519):"
+    read SSH_KEY
+    [[ -z "$SSH_KEY" ]] && { warn "Ключ пустой"; continue; }
+    [[ "$SSH_KEY" =~ ^(ssh-rsa|ssh-ed25519)[[:space:]].*$ ]] && break || warn "Неверный формат ключа"
+  done
 fi
 
 while true; do
-    read -p "Введите субдомен (например, us.domain.com): " SUBDOMAIN
-    if [ -z "$SUBDOMAIN" ]; then
-        warning "Субдомен не может быть пустым. Пожалуйста, введите значение."
-    else
-        break
-    fi
+  read -p "Субдомен (например, us.domain.com): " SUBDOMAIN
+  [[ -n "$SUBDOMAIN" ]] && break || warn "Субдомен пустой"
 done
 
 while true; do
-    read -p "Введите имя ноды (например, us-node-1): " NODE_NAME
-    if [ -z "$NODE_NAME" ]; then
-        warning "Имя ноды не может быть пустым. Пожалуйста, введите значение."
-    else
-        break
-    fi
+  read -p "Имя ноды (например, us-node-1): " NODE_NAME
+  [[ -n "$NODE_NAME" ]] && break || warn "Имя ноды пустое"
 done
 
 while true; do
-    read -p "Введите email для Let's Encrypt (обязательно, не фейк): " LE_EMAIL
-    if [ -z "$LE_EMAIL" ]; then
-        warning "Email не может быть пустым. Пожалуйста, введите значение."
-    else
-        break
-    fi
+  read -p "Email для Let's Encrypt: " LE_EMAIL
+  if [ -z "$LE_EMAIL" ]; then warn "Email пустой"; else break; fi  # фикс -z
 done
 
-read -p "Введите порт для сервиса (по умолчанию 62050): " SERVICE_PORT
-SERVICE_PORT=${SERVICE_PORT:-62050}
-read -p "Введите порт для API (по умолчанию 62051): " API_PORT
-API_PORT=${API_PORT:-62051}
+read -p "SERVICE порт [62050]: " SERVICE_PORT; SERVICE_PORT=${SERVICE_PORT:-62050}
+read -p "API порт [62051]: " API_PORT; API_PORT=${API_PORT:-62051}
 
 if $XHTTP_MODE; then
-    echo
-    echo "Укажи домены, которые должны идти в XHTTP (через пробел)."
-    echo "Например: login.vpnabe.online x.vpnabe.online sp1.zvng.ru"
-    echo "Если оставить пустым — XHTTP-роутинг по 443 будет только для явно указанных позже (по умолчанию всё, кроме ${SUBDOMAIN}, попадёт в блок)."
-    read -r XHTTP_SNI_LINE || true
-    # нормализуем в массив
-    read -ra XHTTP_SNI <<< "${XHTTP_SNI_LINE:-}"
+  echo "Домены (SNI), которые должны идти в XHTTP (через пробел)."
+  echo "Пример: login.vpnabe.online x.vpnabe.online sp1.zvng.ru ya.ru google.com"
+  read -r XHTTP_SNI_LINE || true
+  read -ra XHTTP_SNI <<< "${XHTTP_SNI_LINE:-}"
 fi
 
-log "Введите SSL client сертификат (После Enter - Ctrl+D для завершения ввода):"
+log "Вставьте SSL client сертификат (после Enter нажмите Ctrl+D):"
 SSL_CERT=$(cat)
-if [ -z "$SSL_CERT" ]; then
-    error "SSL сертификат не может быть пустым."
-fi
+[[ -z "$SSL_CERT" ]] && err "Сертификат пустой"
 
 CERT_BODY=$(echo "$SSL_CERT" | grep -v "BEGIN CERTIFICATE" | grep -v "END CERTIFICATE" | tr -d '\n')
-if [[ ! $CERT_BODY =~ ^[A-Za-z0-9+/=]+$ ]]; then
-    error "Некорректный формат сертификата. Пожалуйста, предоставьте валидный SSL сертификат."
-fi
-
-debug "Субдомен: ${SUBDOMAIN}"
-debug "Название ноды: ${NODE_NAME}"
-debug "Service port: ${SERVICE_PORT}"
-debug "API port: ${API_PORT}"
+[[ $CERT_BODY =~ ^[A-Za-z0-9+/=]+$ ]] || err "Неверный формат сертификата"
 
 MAIN_DOMAIN=$(echo ${SUBDOMAIN} | awk -F. '{print $(NF-1)"."$NF}')
-debug "Основной домен: ${MAIN_DOMAIN}"
+dbg "MAIN_DOMAIN=${MAIN_DOMAIN}"
 
-# ======================== Установка системных компонентов ========================
-log "Системные компоненты..."
-apt update 2>&1 | while read -r line; do debug "$line"; done
-apt upgrade -y 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при обновлении системы"
-apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка при установке базовых пакетов"
+# ==================== Система ====================
+log "Обновление системы и базовые пакеты..."
+apt update 2>&1 | while read -r l; do dbg "$l"; done
+apt upgrade -y 2>&1 | while read -r l; do dbg "$l"; done
+apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnupg2 ubuntu-keyring socat cron 2>&1 | while read -r l; do dbg "$l"; done
+systemctl enable --now cron
 
-# ======================== Опциональная установка BBR ========================
+# ==================== BBR ====================
 if $INSTALL_BBR; then
-    log "Установка BBRv3..."
-    curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 > /root/bbrv3.sh || error "Ошибка при скачивании BBRv3"
-    chmod +x /root/bbrv3.sh
-    expect << 'EOF'
+  log "Установка BBRv3..."
+  curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 -o /root/bbrv3.sh || err "Не скачал bbrv3.sh"
+  chmod +x /root/bbrv3.sh
+  expect <<'EOF'
+set timeout -1
 spawn bash /root/bbrv3.sh
 expect "Enter"
 send "1\r"
-expect "y/n"
+expect -re "(y/n|Y/n)"
 send "y\r"
 expect eof
 EOF
-    rm -f /root/bbrv3.sh
+  rm -f /root/bbrv3.sh
 else
-    debug "BBR не устанавливается."
+  dbg "BBR не ставим."
 fi
 
-log "Установка NGINX и acme.sh..."
+# ==================== NGINX ====================
+log "Установка NGINX..."
 curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
 gpg --dry-run --quiet --no-keyring --import --import-options import-show /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" | tee /etc/apt/sources.list.d/nginx.list >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" > /etc/apt/sources.list.d/nginx.list
 cat >/etc/apt/preferences.d/99nginx <<'EOF'
 Package: *
 Pin: origin nginx.org
 Pin: release o=nginx
 Pin-Priority: 900
 EOF
-apt update 2>&1 | while read -r line; do debug "$line"; done
-apt install -y nginx || error "Ошибка при установке Nginx"
+apt update 2>&1 | while read -r l; do dbg "$l"; done
+apt install -y nginx
 mkdir -p /etc/nginx
-openssl dhparam -out /etc/nginx/dhparam.pem 2048 || error "Ошибка при генерации dhparam"
+openssl dhparam -out /etc/nginx/dhparam.pem 2048
 
-# acme.sh install/update
-log "Установка/обновление acme.sh..."
-curl -fsSL https://get.acme.sh | sh || error "Ошибка при установке acme.sh"
-export LE_EMAIL="${LE_EMAIL}"
+# ==================== ACME (Let’s Encrypt) ====================
+log "Устанавливаем acme.sh и регистрируем аккаунт..."
 export HOME="/root"
+curl -fsSL https://get.acme.sh | sh
 . /root/.acme.sh/acme.sh.env
-
 ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+~/.acme.sh/acme.sh --register-account -m "${LE_EMAIL}" --server letsencrypt || warn "LE аккаунт уже есть"
 
-log "Регистрация аккаунта Let's Encrypt через acme.sh..."
-~/.acme.sh/acme.sh --register-account -m "${LE_EMAIL}" --server letsencrypt || warning "Аккаунт LE уже зарегистрирован"
+log "Выпуск wildcard для ${MAIN_DOMAIN} (+ *.${MAIN_DOMAIN}) через ${DNS_PROVIDER}..."
+~/.acme.sh/acme.sh --issue --dns ${DNS_API} -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --keylength ec-256 --dnssleep 120 --force
 
-log "Выпуск wildcard SSL для ${MAIN_DOMAIN} и *.${MAIN_DOMAIN} через $DNS_PROVIDER..."
-~/.acme.sh/acme.sh --issue --dns $DNS_API -d "${MAIN_DOMAIN}" -d "*.${MAIN_DOMAIN}" --keylength ec-256 --dnssleep 120 --force --home /root/.acme.sh || error "Не удалось получить wildcard сертификат через $DNS_PROVIDER"
-
+log "Деплой сертификатов в боевые пути + auto-reload nginx при продлении..."
 mkdir -p /etc/letsencrypt/live/${MAIN_DOMAIN}
-cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/${MAIN_DOMAIN}.key /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem
-cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/fullchain.cer /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem
-cp /root/.acme.sh/${MAIN_DOMAIN}_ecc/ca.cer /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem
+~/.acme.sh/acme.sh --install-cert -d "${MAIN_DOMAIN}" --ecc \
+  --key-file       "/etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem" \
+  --fullchain-file "/etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem" \
+  --ca-file        "/etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem" \
+  --reloadcmd      "systemctl reload nginx"
 
-# ======================== Функции генерации конфигов Nginx ========================
+# ==================== NGINX конфиги ====================
 write_nginx_common_conf() {
-cat > /etc/nginx/nginx.conf << 'EOF'
-user www-data;
-pid /var/run/nginx.pid;
+cat > /etc/nginx/nginx.conf <<'EOF'
+user  www-data;
+pid   /var/run/nginx.pid;
 worker_processes auto;
 worker_rlimit_nofile 65535;
 error_log /var/log/nginx/error.log;
 include /etc/nginx/modules-enabled/*.conf;
 
-events {
-    multi_accept on;
-    worker_connections 1024;
-}
+events { multi_accept on; worker_connections 1024; }
 
 http {
-    map $request_uri $cleaned_request_uri {
-        default $request_uri;
-        "~^(.*?)(\?x_padding=[^ ]*)$" $1;
-    }
-    log_format json_analytics escape=json '{'
-        '$time_local, '
-        '$http_x_forwarded_for, '
-        '$proxy_protocol_addr, '
-        '$request_method '
-        '$status, '
-        '$http_user_agent, '
-        '$cleaned_request_uri, '
-        '$http_referer, '
-        '}';
-    set_real_ip_from 127.0.0.1;
-    real_ip_header X-Forwarded-For;
-    real_ip_recursive on;
-    access_log /var/log/nginx/access.log json_analytics;
+  map $request_uri $cleaned_request_uri {
+    default $request_uri;
+    "~^(.*?)(\?x_padding=[^ ]*)$" $1;
+  }
+  log_format json_analytics escape=json '{'
+    '$time_local, $remote_addr, $request_method $status, '
+    '$http_user_agent, $cleaned_request_uri, $http_referer }';
 
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-    server_tokens off;
-    log_not_found off;
-    types_hash_max_size 2048;
-    types_hash_bucket_size 64;
-    client_max_body_size 16M;
-    keepalive_timeout 75s;
-    keepalive_requests 1000;
-    reset_timedout_connection on;
+  access_log /var/log/nginx/access.log json_analytics;
+  sendfile on; tcp_nopush on; tcp_nodelay on;
+  server_tokens off; log_not_found off;
+  types_hash_max_size 2048; types_hash_bucket_size 64;
+  client_max_body_size 16M;
+  keepalive_timeout 75s; keepalive_requests 1000; reset_timedout_connection on;
 
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
+  include /etc/nginx/mime.types; default_type application/octet-stream;
 
-    ssl_session_timeout 1d;
-    ssl_session_cache shared:SSL:1m;
-    ssl_session_tickets off;
-    ssl_prefer_server_ciphers on;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
-    ssl_stapling on;
-    ssl_stapling_verify on;
+  ssl_session_timeout 1d; ssl_session_cache shared:SSL:1m; ssl_session_tickets off;
+  ssl_prefer_server_ciphers on; ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_ciphers TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+  ssl_stapling on; ssl_stapling_verify on;
 
-    resolver 127.0.0.1 valid=60s;
-    resolver_timeout 2s;
+  gzip on;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "no-referrer-when-downgrade" always;
+  add_header Permissions-Policy "interest-cohort=()" always;
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+  add_header X-Frame-Options "SAMEORIGIN";
+  proxy_hide_header X-Powered-By;
 
-    gzip on;
-
-    add_header X-XSS-Protection "0" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "no-referrer-when-downgrade" always;
-    add_header Permissions-Policy "interest-cohort=()" always;
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
-    add_header X-Frame-Options "SAMEORIGIN";
-
-    proxy_hide_header X-Powered-By;
-
-    include /etc/nginx/conf.d/*.conf;
+  include /etc/nginx/conf.d/*.conf;
 }
-
-stream {
-    include /etc/nginx/stream-enabled/stream.conf;
-}
+stream { include /etc/nginx/stream-enabled/stream.conf; }
 EOF
 }
 
+# xHTTP + заглушка, БЕЗ proxy_protocol
 write_nginx_xhttp_with_stub() {
-    mkdir -p /etc/nginx/stream-enabled
+  mkdir -p /etc/nginx/stream-enabled
 
-    # Соберём map динамически: ${SUBDOMAIN} -> web; XHTTP_SNI[*] -> xhttp; default -> block
-    {
-        echo 'map $ssl_preread_server_name $backend {'
-        echo '    default block;'
-        echo "    ${SUBDOMAIN} web;"
-        if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
-            for d in "${XHTTP_SNI[@]}"; do
-                [[ -n "$d" ]] && echo "    ${d} xhttp;"
-            done
-        fi
-        echo '}'
-        echo
-        echo 'upstream block {'
-        echo '    server 127.0.0.1:36076;'
-        echo '}'
-        echo 'upstream xhttp {'
-        echo '    server 127.0.0.1:5443;'
-        echo '}'
-        echo 'upstream web {'
-        echo '    server 127.0.0.1:36077;'
-        echo '}'
-        echo 'server {'
-        echo '    listen 443 reuseport;'
-        echo '    ssl_preread on;'
-        echo '    proxy_protocol on;'
-        echo '    proxy_pass $backend;'
-        echo '}'
-    } > /etc/nginx/stream-enabled/stream.conf
-
-cat > /etc/nginx/conf.d/local.conf << EOF
-server {
-    listen 80;
-    server_name ${SUBDOMAIN};
-    location / {
-        return 301 https://${SUBDOMAIN}\$request_uri;
-    }
-}
-
-# Upstream "block": принудительный reject для лишних SNI
-server {
-    listen 36076 ssl proxy_protocol;
-    ssl_reject_handshake on;
-}
-
-# Upstream "web": реальная заглушка HTTPS на 36077
-server {
-    listen 36077 ssl proxy_protocol http2;
-    server_name ${SUBDOMAIN};
-    ssl_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
-    ssl_dhparam /etc/nginx/dhparam.pem;
-
-    index index.html;
-    root /var/www/${SUBDOMAIN}/;
-}
-EOF
-
-    mkdir -p /var/www/${SUBDOMAIN}
-    if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
-cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Service is up</title>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;background:#0f1220;color:#e6e6e6;margin:0;display:flex;justify-content:center;align-items:center;height:100vh}
-.card{background:#171a2a;border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.4);padding:28px;max-width:520px;text-align:center}
-h1{font-size:28px;margin:0 0 10px}
-p{opacity:.9;line-height:1.5}
-small{opacity:.6}
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>elite.vzroslie.ru</h1>
-  <p>Узел онлайн. Это техническая заглушка для проверки доступности домена и TLS.</p>
-  <small>© VPNation</small>
-</div>
-</body>
-</html>
-EOF
+  {
+    echo 'map $ssl_preread_server_name $backend {'
+    echo '    default block;'
+    echo "    ${SUBDOMAIN} web;"
+    if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
+      for d in "${XHTTP_SNI[@]}"; do
+        [ -n "$d" ] && echo "    ${d} xhttp;"
+      done
     fi
-    chown -R www-data:www-data /var/www/${SUBDOMAIN}
-    chmod -R 755 /var/www/${SUBDOMAIN}
+    echo '}'
+    echo
+    echo 'upstream block { server 127.0.0.1:36076; }'
+    echo 'upstream xhttp { server 127.0.0.1:5443; }'
+    echo 'upstream web   { server 127.0.0.1:36077; }'
+    echo 'server {'
+    echo '  listen 443 reuseport;'
+    echo '  ssl_preread on;'
+    echo '  proxy_pass $backend;'
+    echo '}'
+  } > /etc/nginx/stream-enabled/stream.conf
+
+  cat > /etc/nginx/conf.d/local.conf <<EOF
+server {
+  listen 80;
+  server_name ${SUBDOMAIN};
+  location / { return 301 https://${SUBDOMAIN}\$request_uri; }
+}
+server {
+  listen 36076 ssl;
+  ssl_reject_handshake on;
+}
+server {
+  listen 36077 ssl http2;
+  server_name ${SUBDOMAIN};
+  ssl_certificate           /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
+  ssl_certificate_key       /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
+  ssl_trusted_certificate   /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
+  ssl_dhparam               /etc/nginx/dhparam.pem;
+  root /var/www/${SUBDOMAIN}/;
+  index index.html;
+}
+EOF
+
+  mkdir -p /var/www/${SUBDOMAIN}
+  if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
+    cat > /var/www/${SUBDOMAIN}/index.html <<'EOF'
+<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Service is up</title><style>
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}
+main{min-height:100vh;display:grid;place-items:center;background:#0b1220;color:#e6edf3}
+.card{background:#111827;border:1px solid #243244;border-radius:16px;padding:28px 32px;max-width:640px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+h1{margin:0 0 10px;font-size:24px}p{margin:0;color:#9fb0c3}
+</style></head><body><main><div class="card">
+<h1>Узел активен</h1><p>Техническая заглушка HTTPS. TLS работает.</p>
+</div></main></body></html>
+EOF
+  fi
+  chown -R www-data:www-data /var/www/${SUBDOMAIN}; chmod -R 755 /var/www/${SUBDOMAIN}
 }
 
+# «else»-режим (ваша прежняя схема, без proxy_protocol для совместимости)
 write_nginx_else_with_site() {
-    mkdir -p /etc/nginx/stream-enabled
-cat > /etc/nginx/stream-enabled/stream.conf << EOF
+  mkdir -p /etc/nginx/stream-enabled
+cat > /etc/nginx/stream-enabled/stream.conf <<EOF
 map \$ssl_preread_server_name \$backend {
-    default block;
-    ${SUBDOMAIN} web;
+  default block;
+  ${SUBDOMAIN} web;
 }
-upstream block {
-    server 127.0.0.1:36076;
-}
-upstream web {
-    server 127.0.0.1:7443;
-}
-upstream xtls {
-    server 127.0.0.1:8443;
-}
+upstream block { server 127.0.0.1:36076; }
+upstream web   { server 127.0.0.1:7443; }
+upstream xtls  { server 127.0.0.1:8443; }
 server {
-    listen 443 reuseport;
-    ssl_preread on;
-    proxy_protocol on;
-    proxy_pass \$backend;
+  listen 443 reuseport;
+  ssl_preread on;
+  proxy_pass \$backend;
 }
 EOF
 
-cat > /etc/nginx/conf.d/local.conf << EOF
+cat > /etc/nginx/conf.d/local.conf <<EOF
 server {
-    listen 80;
-    server_name ${SUBDOMAIN};
-    location / {
-        return 301 https://${SUBDOMAIN}\$request_uri;
-    }
+  listen 80;
+  server_name ${SUBDOMAIN};
+  location / { return 301 https://${SUBDOMAIN}\$request_uri; }
 }
 server {
-    listen 9090 default_server;
-    server_name ${SUBDOMAIN};
-    location / {
-        return 301 https://${SUBDOMAIN}\$request_uri;
-    }
+  listen 9090 default_server;
+  server_name ${SUBDOMAIN};
+  location / { return 301 https://${SUBDOMAIN}\$request_uri; }
 }
 server {
-    listen 36076 ssl proxy_protocol;
-    ssl_reject_handshake on;
+  listen 36076 ssl;
+  ssl_reject_handshake on;
 }
 server {
-    listen 36077 ssl proxy_protocol;
-    http2 on;
-    server_name ${SUBDOMAIN};
-    ssl_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
-    ssl_dhparam /etc/nginx/dhparam.pem;
-    index index.html;
-    root /var/www/${SUBDOMAIN}/;
+  listen 36077 ssl http2;
+  server_name ${SUBDOMAIN};
+  ssl_certificate           /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
+  ssl_certificate_key       /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
+  ssl_trusted_certificate   /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
+  ssl_dhparam               /etc/nginx/dhparam.pem;
+  root /var/www/${SUBDOMAIN}/;
+  index index.html;
 }
 EOF
 
-    mkdir -p /var/www/${SUBDOMAIN}
-    if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
-cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cloud Storage - Login</title>
-<style>
-body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:0;display:flex;justify-content:center;align-items:center;height:100vh}
-.login-container{background:#fff;padding:40px;border-radius:10px;box-shadow:0 0 20px rgba(0,0,0,.1);width:100%;max-width:400px}
-.login-header{text-align:center;margin-bottom:30px}
-.login-header h1{color:#333;margin:0;font-size:24px}
-.form-group{margin-bottom:20px}
-.form-group label{display:block;margin-bottom:5px;color:#666}
-.form-group input{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
-.submit-btn{width:100%;padding:12px;background:#007bff;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:16px}
-.submit-btn:hover{background:#0056b3}
-.footer{text-align:center;margin-top:20px;color:#666;font-size:14px}
-</style>
-</head>
-<body>
-<div class="login-container">
-  <div class="login-header"><h1>Cloud Storage</h1></div>
-  <form onsubmit="return false;">
-    <div class="form-group"><label>Email</label><input type="email" required></div>
-    <div class="form-group"><label>Password</label><input type="password" required></div>
-    <button class="submit-btn">Log In</button>
-  </form>
-  <div class="footer"><p>Protected by CloudFlare</p></div>
-</div>
-</body>
-</html>
-EOF
-    fi
-    chown -R www-data:www-data /var/www/${SUBDOMAIN}
-    chmod -R 755 /var/www/${SUBDOMAIN}
+  mkdir -p /var/www/${SUBDOMAIN}
+  if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
+    echo "<h1>Cloud Storage</h1>" > /var/www/${SUBDOMAIN}/index.html
+  fi
+  chown -R www-data:www-data /var/www/${SUBDOMAIN}; chmod -R 755 /var/www/${SUBDOMAIN}
 }
 
-# ======================== Генерация конфигов Nginx ========================
-log "Nginx конфиг..."
+# Применяем
+log "Генерация конфигов nginx..."
 mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup 2>/dev/null || true
 mkdir -p /etc/nginx/stream-enabled
 rm -f /etc/nginx/conf.d/default.conf 2>/dev/null || true
-
 write_nginx_common_conf
-if $XHTTP_MODE; then
-    write_nginx_xhttp_with_stub
-else
-    write_nginx_else_with_site
-fi
+if $XHTTP_MODE; then write_nginx_xhttp_with_stub; else write_nginx_else_with_site; fi
 
-# ======================== Установка Marzban Node ========================
+# ==================== Marzban Node ====================
 log "Установка Marzban Node..."
-curl -fsSL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh > /root/marzban-node.sh
+curl -fsSL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh -o /root/marzban-node.sh
 chmod +x /root/marzban-node.sh
 
-expect << EOF
-spawn /root/marzban-node.sh @ install --name ${NODE_NAME}
-expect "Please paste the content of the Client Certificate"
-send -- "-----BEGIN CERTIFICATE-----\n"
-send -- "${CERT_BODY}\n"
-send -- "-----END CERTIFICATE-----\n\n"
-expect "Do you want to use REST protocol?"
-send -- "y\n"
-expect "Enter the SERVICE_PORT"
-send -- "${SERVICE_PORT}\n"
-expect "Enter the
+export CERT_BODY SERVICE_PORT API_PORT NODE_NAME
+expect <<'EOF'
+set timeout -1
+spawn /root/marzban-node.sh @ install --name $env(NODE_NAME)
+# Вставка клиентского сертификата
+expect -re {Please paste .* Client Certificate}
+send -- "-----BEGIN CERTIFICATE-----\r"
+send -- "$env(CERT_BODY)\r"
+send -- "-----END CERTIFICATE-----\r\r"
+# Включаем REST
+expect -re {(Do you want to use REST protocol\?.*)}
+send -- "y\r"
+# Порты
+expect -re {Enter the SERVICE_PORT.*}
+send -- "$env(SERVICE_PORT)\r"
+expect -re {Enter the XRAY_API_PORT.*}
+send -- "$env(API_PORT)\r"
+expect eof
+EOF
+rm -f /root/marzban-node.sh
+
+# Логи
+mkdir -p /var/lib/marzban/log
+touch /var/lib/marzban/log/access.log
+chmod 755 /var/lib/marzban/log
+chmod 644 /var/lib/marzban/log/access.log
+
+DOCKER_COMPOSE_FILE="/opt/${NODE_NAME}/docker-compose.yml"
+if [[ -f "$DOCKER_COMPOSE_FILE" ]]; then
+  if ! grep -q "/var/lib/marzban/log" "$DOCKER_COMPOSE_FILE"; then
+    sed -i '/volumes:/a\      - /var/lib/marzban/log:/var/lib/marzban/log' "$DOCKER_COMPOSE_FILE"
+  fi
+  pushd "/opt/${NODE_NAME}" >/dev/null
+  docker compose down
+  docker compose up -d
+  popd >/dev/null
+else
+  warn "docker-compose.yml не найден — монтирование логов пропущено"
+fi
+
+# ==================== Проверка NGINX ====================
+nginx -t 2>&1 | while read -r l; do dbg "$l"; done
+systemctl enable nginx
+systemctl restart nginx
+systemctl is-active --quiet nginx || err "Nginx не запустился"
+
+# ==================== UFW ====================
+log "Настройка UFW..."
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow ${SSH_PORT}/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+# REST/API только с MASTER_IP (IPv4). Если используете IPv6, добавьте отдельные v6-правила.
+ufw allow from ${MASTER_IP} to any port ${SERVICE_PORT} proto tcp
+ufw allow from ${MASTER_IP} to any port ${API_PORT} proto tcp
+yes | ufw enable
+ufw status verbose | while read -r l; do dbg "$l"; done
+
+# ==================== SSH ====================
+log "Настройка SSH..."
+if $INSTALL_SSH_KEY; then
+  mkdir -p /root/.ssh; chmod 700 /root/.ssh
+  printf "%s\n" "${SSH_KEY}" > /root/.ssh/authorized_keys
+  cat > /etc/ssh/sshd_config <<EOF
+Port ${SSH_PORT}
+Protocol 2
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 60
+AllowUsers root
+EOF
+  systemctl restart ssh
+  systemctl is-active --quiet ssh || err "SSH не запустился"
+else
+  if ! grep -q "^Port " /etc/ssh/sshd_config; then
+    sed -i "1i Port ${SSH_PORT}" /etc/ssh/sshd_config
+  else
+    sed -i "s/^Port .*/Port ${SSH_PORT}/" /etc/ssh/sshd_config
+  fi
+  systemctl restart ssh || true
+fi
+
+log "Готово. Заглушка: https://${SUBDOMAIN}"
+log "Напоминание: при наличии AAAA-записи для домена добавьте IPv6-правила UFW на ${SERVICE_PORT}/${API_PORT}, либо уберите AAAA."
+
+read -p "Перезагрузить систему сейчас? (y/n): " reboot_now
+[[ $reboot_now =~ ^[Yy]$ ]] && { dbg "Перезагрузка..."; reboot; }
