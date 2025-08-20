@@ -22,6 +22,26 @@ log(){ echo -e "${GREEN}[INFO]${NC} $1"; }
 err(){ echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 warn(){ echo -e "${YELLOW}[WARNING]${NC} $1"; }
 dbg(){ echo -e "[DEBUG] $1"; }
+# ---------- совместимость функций логирования ----------
+# если нет debug(), делаем no-op с меткой
+if ! declare -F debug >/dev/null 2>&1; then
+  debug(){ echo -e "[DEBUG] $*"; }
+fi
+# выравниваем warn/warning
+if ! declare -F warn >/dev/null 2>&1; then
+  warn(){ echo -e "${YELLOW:-}[WARNING]${NC:-} $*"; }
+fi
+if ! declare -F warning >/dev/null 2>&1; then
+  warning(){ warn "$@"; }
+fi
+# выравниваем error/err (что бы ни было — оба работают)
+if ! declare -F error >/dev/null 2>&1; then
+  if declare -F err >/dev/null 2>&1; then
+    error(){ err "$@"; }
+  else
+    error(){ echo -e "${RED:-}[ERROR]${NC:-} $*"; exit 1; }
+  fi
+fi
 trap 'err "Неожиданная ошибка на строке $LINENO"' ERR
 
 # ==================== DNS-провайдер для ACME ====================
@@ -111,7 +131,6 @@ read -p "API порт [62051]: " API_PORT; API_PORT=${API_PORT:-62051}
 
 if $XHTTP_MODE; then
   echo "Домены (SNI), которые должны идти в XHTTP (через пробел)."
-  echo "Пример: login.vpnabe.online x.vpnabe.online sp1.zvng.ru ya.ru google.com"
   read -r XHTTP_SNI_LINE || true
   read -ra XHTTP_SNI <<< "${XHTTP_SNI_LINE:-}"
 fi
