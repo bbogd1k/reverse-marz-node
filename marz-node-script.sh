@@ -137,7 +137,7 @@ systemctl enable --now cron
 if $INSTALL_BBR; then
     log "==================== УСТАНОВКА BBRv3 ===================="
     log "Шаг 1.3: Установка BBRv3..."
-    debug "Загрузка скрипта BBRv3..."
+    dbg "Загрузка скрипта BBRv3..."
     curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 > bbrv3.sh || error "Ошибка при скачивании BBRv3"
     expect << 'EOF'
 spawn bash bbrv3.sh
