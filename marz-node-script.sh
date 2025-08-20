@@ -134,33 +134,24 @@ apt install -y curl wget git expect ufw openssl lsb-release ca-certificates gnup
 systemctl enable --now cron
 
 # ======== УСТАНОВКА BBRv3 (устойчивый expect) ========
-log "Установка BBRv3..."
-curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 -o /root/bbrv3.sh || err "Не скачал bbrv3.sh"
-chmod +x /root/bbrv3.sh
-
-# Сторож, чтобы не висело бесконечно (15 минут хватит с запасом)
-timeout 900s expect <<'EOF' || { warn "Автоматизация BBR истекла по таймауту — попробуйте вручную: bash /root/bbrv3.sh"; }
-set timeout -1
-log_user 1
-spawn bash /root/bbrv3.sh
-
-# Главное меню
-expect {
-    -re {Select an option:\s*} { send -- "1\r" }
-    timeout { exit 1 }
-}
-
-# Подтверждения установки / зависимостей / grub
-# Скрипт OPIran любит разные формулировки; ловим типовые варианты и отвечаем "y" либо Enter.
-expect {
-    -re {(Proceed|Do you want|Continue|press y/n).*\(.*[Yy].*/?.*[Nn].*\)} { send -- "y\r"; exp_continue }
-    -re {Press .* to continue}                                             { send -- "\r";  exp_continue }
-    -re {Hit:|Get:|Setting up|Unpacking|Preparing}                         { exp_continue }  ;# шум apt
-    eof
-}
+if $INSTALL_BBR; then
+    log "==================== УСТАНОВКА BBRv3 ===================="
+    log "Шаг 1.3: Установка BBRv3..."
+    debug "Загрузка скрипта BBRv3..."
+    curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4 > bbrv3.sh || error "Ошибка при скачивании BBRv3"
+    expect << 'EOF'
+spawn bash bbrv3.sh
+expect "Enter"
+send "1\r"
+expect "y/n"
+send "y\r"
+expect eof
 EOF
+    rm bbrv3.sh
+else
+    debug "Опциональная установка BBR пропущена."
+fi
 
-rm -f /root/bbrv3.sh
 
 # ==================== NGINX ====================
 log "Установка NGINX..."
