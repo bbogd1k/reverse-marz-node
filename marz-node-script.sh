@@ -27,6 +27,36 @@ log() { echo -e "${GREEN}[INFO]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 debug() { echo -e "[DEBUG] $1"; }
+# --- совместимость лог-функций / алиасы ---
+if ! declare -F debug >/dev/null 2>&1; then debug(){ echo -e "[DEBUG] $*"; } fi
+if ! declare -F warn  >/dev/null 2>&1; then warn(){  echo -e "${YELLOW:-}[WARNING]${NC:-} $*"; } fi
+if ! declare -F warning >/dev/null 2>&1; then warning(){ warn "$@"; } fi
+if ! declare -F dbg >/dev/null 2>&1; then dbg(){ debug "$@"; } fi
+if ! declare -F error >/dev/null 2>&1; then
+  if declare -F err >/dev/null 2>&1; then error(){ err "$@"; }
+  else error(){ echo -e "${RED:-}[ERROR]${NC:-} $*"; exit 1; }
+  fi
+fi
+
+# если нет debug(), делаем no-op с меткой
+if ! declare -F debug >/dev/null 2>&1; then
+  debug(){ echo -e "[DEBUG] $*"; }
+fi
+# выравниваем warn/warning
+if ! declare -F warn >/dev/null 2>&1; then
+  warn(){ echo -e "${YELLOW:-}[WARNING]${NC:-} $*"; }
+fi
+if ! declare -F warning >/dev/null 2>&1; then
+  warning(){ warn "$@"; }
+fi
+# выравниваем error/err (что бы ни было — оба работают)
+if ! declare -F error >/dev/null 2>&1; then
+  if declare -F err >/dev/null 2>&1; then
+    error(){ err "$@"; }
+  else
+    error(){ echo -e "${RED:-}[ERROR]${NC:-} $*"; exit 1; }
+  fi
+fi
 
 trap 'error "Неожиданная ошибка на строке $LINENO"' ERR
 
@@ -154,7 +184,6 @@ API_PORT=${API_PORT:-62051}
 if $XHTTP_MODE; then
     echo
     echo "Укажи домены, которые должны идти в XHTTP (через пробел)."
-    echo "Например: login.vpnabe.online x.vpnabe.online sp1.zvng.ru"
     echo "Если оставить пустым — XHTTP-роутинг по 443 будет только для явно указанных позже (по умолчанию всё, кроме ${SUBDOMAIN}, попадёт в блок)."
     read -r XHTTP_SNI_LINE || true
     # нормализуем в массив
@@ -520,13 +549,20 @@ else
     write_nginx_else_with_site
 fi
 
+# ==================== Проверка NGINX ====================
+nginx -t 2>&1 | while read -r l; do dbg "$l"; done
+systemctl enable nginx
+systemctl restart nginx
+systemctl is-active --quiet nginx || err "Nginx не запустился"
+
 # ======================== Установка Marzban Node ========================
-log "Установка Marzban Node..."
-curl -fsSL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh > /root/marzban-node.sh
-chmod +x /root/marzban-node.sh
+log "==================== УСТАНОВКА MARZBAN NODE ===================="
+log "Этап 3: Установка Marzban Node..."
+curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh > marzban-node.sh
+chmod +x marzban-node.sh
 
 expect << EOF
-spawn /root/marzban-node.sh @ install --name ${NODE_NAME}
+spawn ./marzban-node.sh @ install --name ${NODE_NAME}
 expect "Please paste the content of the Client Certificate"
 send -- "-----BEGIN CERTIFICATE-----\n"
 send -- "${CERT_BODY}\n"
@@ -535,4 +571,81 @@ expect "Do you want to use REST protocol?"
 send -- "y\n"
 expect "Enter the SERVICE_PORT"
 send -- "${SERVICE_PORT}\n"
-expect "Enter the
+expect "Enter the XRAY_API_PORT"
+send -- "${API_PORT}\n"
+expect eof
+EOF
+
+rm -f marzban-node.sh
+
+mkdir -p /var/lib/marzban/log
+touch /var/lib/marzban/log/access.log
+chmod 755 /var/lib/marzban/log
+chmod 644 /var/lib/marzban/log/access.log
+
+DOCKER_COMPOSE_FILE="/opt/${NODE_NAME}/docker-compose.yml"
+if [[ -f "${DOCKER_COMPOSE_FILE}" ]]; then
+    sed -i '/volumes:/a\      - /var/lib/marzban/log:/var/lib/marzban/log' ${DOCKER_COMPOSE_FILE}
+    cd /opt/${NODE_NAME}
+    docker compose down
+    docker compose up -d
+else
+    warning "Файл docker-compose.yml не найден, пропуск настройки монтирования логов."
+fi
+
+# ======================== Финальные проверки и настройки ========================
+log "==================== ФИНАЛЬНЫЕ ПРОВЕРКИ ===================="
+nginx -t 2>&1 | while read -r line; do debug "$line"; done || error "Ошибка в конфигурации Nginx"
+
+systemctl enable nginx 2>&1 | while read -r line; do debug "$line"; done
+systemctl start nginx 2>&1 | while read -r line; do debug "$line"; done
+if ! systemctl is-active --quiet nginx; then
+    error "Не удалось запустить Nginx"
+fi
+
+log "Настройка UFW..."
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow ${SSH_PORT}/tcp
+ufw allow from ${MASTER_IP}
+echo "y" | ufw enable
+ufw status verbose || error "Ошибка при настройке UFW"
+
+log "Настройка SSH..."
+if $INSTALL_SSH_KEY; then
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    cat > /root/.ssh/authorized_keys << EOF
+${SSH_KEY}
+EOF
+
+    # Настройка базового конфига SSH
+    cat > /etc/ssh/sshd_config << EOF
+Port ${SSH_PORT}
+Protocol 2
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 60
+AllowUsers root
+EOF
+
+    systemctl restart ssh
+    if ! systemctl is-active --quiet ssh; then
+        error "Не удалось запустить SSH"
+    fi
+fi
+
+log "Установка успешно завершена!"
+debug "Все компоненты установлены и настроены"
+read -p "Перезагрузить систему сейчас? (y/n): " reboot_now
+if [[ $reboot_now == "y" ]]; then
+    debug "Выполняется перезагрузка системы..."
+    reboot
+fi
