@@ -377,7 +377,6 @@ write_nginx_xhttp_with_stub() {
         echo 'server {'
         echo '    listen 443 reuseport;'
         echo '    ssl_preread on;'
-        echo '    proxy_protocol on;'
         echo '    proxy_pass $backend;'
         echo '}'
     } > /etc/nginx/stream-enabled/stream.conf
