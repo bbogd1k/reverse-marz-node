@@ -370,49 +370,16 @@ stream {
 EOF
 }
 
-write_nginx_xhttp_with_stub() {
-    mkdir -p /etc/nginx/stream-enabled
+write_nginx_https_stub_no_stream() {
+  local www_root="${WWW_ROOT:-/var/www/${SUBDOMAIN}}"
 
-    # Очистим XHTTP_SNI: уберём пустые и совпадающие с SUBDOMAIN
-    local -a XHTTP_SNI_CLEAN=()
-    if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
-        for d in "${XHTTP_SNI[@]}"; do
-            [[ -n "$d" && "$d" != "$SUBDOMAIN" ]] && XHTTP_SNI_CLEAN+=("$d")
-        done
-    fi
+  mkdir -p /etc/nginx/conf.d
+  mkdir -p "${www_root}"
 
-    # ----- stream.conf: SNI → backend (без proxy_protocol) -----
-    {
-        echo 'map $ssl_preread_server_name $backend {'
-        echo '    default block;'
-        echo "    ${SUBDOMAIN} web;"
-        if [ "${#XHTTP_SNI_CLEAN[@]}" -gt 0 ]; then
-            for d in "${XHTTP_SNI_CLEAN[@]}"; do
-                echo "    ${d} xhttp;"
-            done
-        fi
-        echo '}'
-        echo
-        echo 'upstream block {'
-        echo '    server 127.0.0.1:36076;'
-        echo '}'
-        echo 'upstream xhttp {'
-        echo '    server 127.0.0.1:5443;'
-        echo '}'
-        echo 'upstream web {'
-        echo '    server 127.0.0.1:36077;'
-        echo '}'
-        echo 'server {'
-        echo '    listen 443 reuseport;'
-        echo '    ssl_preread on;'
-        echo '    # proxy_protocol OFF — важно для XHTTP'
-        echo '    proxy_pass $backend;'
-        echo '}'
-    } > /etc/nginx/stream-enabled/stream.conf
-
-    # ----- local.conf: HTTP редиректы на заглушку + HTTPS заглушка -----
-    {
-cat <<EOF
+  # ----- /etc/nginx/conf.d/local.conf -----
+  {
+    # HTTP :80 → 301 на основной SUBDOMAIN
+    cat <<EOF
 server {
     listen 80;
     server_name ${SUBDOMAIN};
@@ -420,51 +387,73 @@ server {
 }
 EOF
 
-        # Для КАЖДОГО XHTTP_SNI: HTTP → 301 на заглушку
-        if [ "${#XHTTP_SNI_CLEAN[@]}" -gt 0 ]; then
-            for d in "${XHTTP_SNI_CLEAN[@]}"; do
-cat <<EOF
+    if [ "${#REDIRECT_SNI[@]}" -gt 0 ]; then
+      for d in "${REDIRECT_SNI[@]}"; do
+        [ -n "$d" ] || continue
+        cat <<EOF
 server {
     listen 80;
     server_name ${d};
     location / { return 301 https://${SUBDOMAIN}\$request_uri; }
 }
 EOF
-            done
-        fi
+      done
+    fi
 
-        # L4 "block" — намеренный reject (без proxy_protocol, т.к. stream тоже без него)
-cat <<EOF
+    # L4-заглушка (как у тебя): «намеренный reject» на отдельном порту
+    cat <<'EOF'
 server {
     listen 36076 ssl;
     ssl_reject_handshake on;
 }
 EOF
 
-        # HTTPS заглушка: слушает ТОЛЬКО localhost и принимает сразу ВСЕ host'ы
-        # Любой хост, отличный от ${SUBDOMAIN}, редиректится на ${SUBDOMAIN}
-        local ALL_SRV_NAMES="${SUBDOMAIN}"
-        if [ "${#XHTTP_SNI_CLEAN[@]}" -gt 0 ]; then
-            ALL_SRV_NAMES="${ALL_SRV_NAMES} ${XHTTP_SNI_CLEAN[*]}"
-        fi
-cat <<EOF
+    # HTTPS 443: основной хост со статикой
+    cat <<EOF
 server {
-    listen 127.0.0.1:36077 ssl http2;
-    server_name ${ALL_SRV_NAMES};
+    listen 443 ssl http2;
+    server_name ${SUBDOMAIN};
+
     ssl_certificate         /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
     ssl_certificate_key     /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
     ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
     ssl_dhparam             /etc/nginx/dhparam.pem;
 
-    if (\$host != "${SUBDOMAIN}") {
-        return 301 https://${SUBDOMAIN}\$request_uri;
-    }
-
+    root  ${www_root};
     index index.html;
-    root  /var/www/${SUBDOMAIN}/;
 }
 EOF
-    } > /etc/nginx/conf.d/local.conf
+
+    # HTTPS 443: для каждого редиректного хоста — сразу 301 на SUBDOMAIN
+    if [ "${#REDIRECT_SNI[@]}" -gt 0 ]; then
+      for d in "${REDIRECT_SNI[@]}"; do
+        [ -n "$d" ] || continue
+        cat <<EOF
+server {
+    listen 443 ssl http2;
+    server_name ${d};
+
+    ssl_certificate         /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
+    ssl_certificate_key     /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
+    ssl_dhparam             /etc/nginx/dhparam.pem;
+
+    return 301 https://${SUBDOMAIN}\$request_uri;
+}
+EOF
+      done
+    fi
+  } > /etc/nginx/conf.d/local.conf
+
+  # КРИТИЧЕСКОЕ: убедимся, что stream на 443 НЕ включён.
+  # Если у тебя есть /etc/nginx/stream-enabled/stream.conf со слушателем 443 — отключи его:
+  if grep -qE 'listen[[:space:]]+443' /etc/nginx/stream-enabled/stream.conf 2>/dev/null; then
+    echo "[warn] Обнаружен stream 443. Комментирую, чтобы избежать конфликта и 406."
+    sed -i 's/^\([[:space:]]*listen[[:space:]]\+443\)/# \1/' /etc/nginx/stream-enabled/stream.conf || true
+  fi
+
+  nginx -t && systemctl reload nginx
+}
 
     # ----- новая «скример»-заглушка -----
     mkdir -p /var/www/${SUBDOMAIN}
