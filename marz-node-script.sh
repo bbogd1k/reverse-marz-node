@@ -58,6 +58,26 @@ if ! declare -F error >/dev/null 2>&1; then
   fi
 fi
 
+# если нет debug(), делаем no-op с меткой
+if ! declare -F debug >/dev/null 2>&1; then
+  debug(){ echo -e "[DEBUG] $*"; }
+fi
+# выравниваем warn/warning
+if ! declare -F warn >/dev/null 2>&1; then
+  warn(){ echo -e "${YELLOW:-}[WARNING]${NC:-} $*"; }
+fi
+if ! declare -F warning >/dev/null 2>&1; then
+  warning(){ warn "$@"; }
+fi
+# выравниваем error/err (что бы ни было — оба работают)
+if ! declare -F error >/dev/null 2>&1; then
+  if declare -F err >/dev/null 2>&1; then
+    error(){ err "$@"; }
+  else
+    error(){ echo -e "${RED:-}[ERROR]${NC:-} $*"; exit 1; }
+  fi
+fi
+
 trap 'error "Неожиданная ошибка на строке $LINENO"' ERR
 
 # ======================== Выбор DNS-провайдера ========================
