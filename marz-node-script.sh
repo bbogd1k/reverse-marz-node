@@ -370,15 +370,37 @@ stream {
 EOF
 }
 
-write_nginx_https_stub_no_stream() {
-  local www_root="${WWW_ROOT:-/var/www/${SUBDOMAIN}}"
-
+write_nginx_xhttp_with_stub() {
+  mkdir -p /etc/nginx/stream-enabled
   mkdir -p /etc/nginx/conf.d
-  mkdir -p "${www_root}"
+  local WWW_ROOT_LOCAL="${WWW_ROOT:-/var/www/${SUBDOMAIN}}"
 
-  # ----- /etc/nginx/conf.d/local.conf -----
+  # --- stream.conf: наружный :443 → по SNI в web/xhttp/block ---
   {
-    # HTTP :80 → 301 на основной SUBDOMAIN
+    echo 'map $ssl_preread_server_name $backend {'
+    echo '    default block;'
+    echo "    ${SUBDOMAIN} web;"
+    if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
+      for d in "${XHTTP_SNI[@]}"; do
+        [ -n "$d" ] && echo "    ${d} xhttp;"
+      done
+    fi
+    echo '}'
+    echo
+    echo 'upstream block { server 127.0.0.1:36076; }'
+    echo 'upstream xhttp { server 127.0.0.1:5443; }'
+    echo 'upstream web   { server 127.0.0.1:36077; }'
+    echo
+    echo 'server {'
+    echo '    listen 443 reuseport;'
+    echo '    ssl_preread on;'
+    echo '    proxy_pass $backend;'
+    echo '}'
+  } > /etc/nginx/stream-enabled/stream.conf
+
+  # --- local.conf: :80 редиректы + L4-заглушка + ВЕБ на 127.0.0.1:36077 ---
+  {
+    # :80 → 301 на основной хост
     cat <<EOF
 server {
     listen 80;
@@ -387,8 +409,9 @@ server {
 }
 EOF
 
-    if [ "${#REDIRECT_SNI[@]}" -gt 0 ]; then
-      for d in "${REDIRECT_SNI[@]}"; do
+    # для каждого XHTTP-SNI — :80 → 301 на SUBDOMAIN (HTTPS для них НЕ поднимаем!)
+    if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
+      for d in "${XHTTP_SNI[@]}"; do
         [ -n "$d" ] || continue
         cat <<EOF
 server {
@@ -400,7 +423,7 @@ EOF
       done
     fi
 
-    # L4-заглушка (как у тебя): «намеренный reject» на отдельном порту
+    # L4 заглушка (stream backend "block")
     cat <<'EOF'
 server {
     listen 36076 ssl;
@@ -408,10 +431,10 @@ server {
 }
 EOF
 
-    # HTTPS 443: основной хост со статикой
+    # ВЕБ: слушаем ТОЛЬКО локально (куда прокинет stream как "web")
     cat <<EOF
 server {
-    listen 443 ssl http2;
+    listen 127.0.0.1:36077 ssl http2;
     server_name ${SUBDOMAIN};
 
     ssl_certificate         /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
@@ -419,37 +442,32 @@ server {
     ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
     ssl_dhparam             /etc/nginx/dhparam.pem;
 
-    root  ${www_root};
+    # РЕКОМЕНДОВАННЫЕ TLS/заголовки (безопасно и совместимо)
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers on;
+
+    ssl_session_cache shared:SSL:20m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    ssl_stapling on;
+    ssl_stapling_verify on;
+
+    add_header Strict-Transport-Security "max-age=15552000" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    root  ${WWW_ROOT_LOCAL};
     index index.html;
 }
 EOF
-
-    # HTTPS 443: для каждого редиректного хоста — сразу 301 на SUBDOMAIN
-    if [ "${#REDIRECT_SNI[@]}" -gt 0 ]; then
-      for d in "${REDIRECT_SNI[@]}"; do
-        [ -n "$d" ] || continue
-        cat <<EOF
-server {
-    listen 443 ssl http2;
-    server_name ${d};
-
-    ssl_certificate         /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
-    ssl_certificate_key     /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
-    ssl_dhparam             /etc/nginx/dhparam.pem;
-
-    return 301 https://${SUBDOMAIN}\$request_uri;
-}
-EOF
-      done
-    fi
   } > /etc/nginx/conf.d/local.conf
 
-  # КРИТИЧЕСКОЕ: убедимся, что stream на 443 НЕ включён.
-  # Если у тебя есть /etc/nginx/stream-enabled/stream.conf со слушателем 443 — отключи его:
-  if grep -qE 'listen[[:space:]]+443' /etc/nginx/stream-enabled/stream.conf 2>/dev/null; then
-    echo "[warn] Обнаружен stream 443. Комментирую, чтобы избежать конфликта и 406."
-    sed -i 's/^\([[:space:]]*listen[[:space:]]\+443\)/# \1/' /etc/nginx/stream-enabled/stream.conf || true
+  # ВАЖНО: в http{} должен быть resolver для OCSP stapling
+  if ! grep -qE '^\s*resolver\s+' /etc/nginx/nginx.conf; then
+    echo "[warn] Добавь в http{}:  resolver 1.1.1.1 9.9.9.9 valid=300s; resolver_timeout 5s;"
   fi
 
   nginx -t && systemctl reload nginx
