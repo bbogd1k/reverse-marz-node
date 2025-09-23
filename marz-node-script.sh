@@ -353,14 +353,22 @@ EOF
 write_nginx_xhttp_with_stub() {
     mkdir -p /etc/nginx/stream-enabled
 
-    # Соберём map динамически: ${SUBDOMAIN} -> web; XHTTP_SNI[*] -> xhttp; default -> block
+    # Очистим XHTTP_SNI: уберём пустые и совпадающие с SUBDOMAIN
+    local -a XHTTP_SNI_CLEAN=()
+    if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
+        for d in "${XHTTP_SNI[@]}"; do
+            [[ -n "$d" && "$d" != "$SUBDOMAIN" ]] && XHTTP_SNI_CLEAN+=("$d")
+        done
+    fi
+
+    # ----- stream.conf: SNI → backend (без proxy_protocol) -----
     {
         echo 'map $ssl_preread_server_name $backend {'
         echo '    default block;'
         echo "    ${SUBDOMAIN} web;"
-        if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
-            for d in "${XHTTP_SNI[@]}"; do
-                [[ -n "$d" ]] && echo "    ${d} xhttp;"
+        if [ "${#XHTTP_SNI_CLEAN[@]}" -gt 0 ]; then
+            for d in "${XHTTP_SNI_CLEAN[@]}"; do
+                echo "    ${d} xhttp;"
             done
         fi
         echo '}'
@@ -377,85 +385,232 @@ write_nginx_xhttp_with_stub() {
         echo 'server {'
         echo '    listen 443 reuseport;'
         echo '    ssl_preread on;'
+        echo '    # proxy_protocol OFF — важно для XHTTP'
         echo '    proxy_pass $backend;'
         echo '}'
     } > /etc/nginx/stream-enabled/stream.conf
 
-cat > /etc/nginx/conf.d/local.conf << EOF
+    # ----- local.conf: HTTP редиректы на заглушку + HTTPS заглушка -----
+    {
+cat <<EOF
 server {
     listen 80;
     server_name ${SUBDOMAIN};
-    location / {
-        return 301 https://${SUBDOMAIN}\$request_uri;
-    }
-}
-
-# Upstream "block": принудительный reject для лишних SNI
-server {
-    listen 36076 ssl proxy_protocol;
-    ssl_reject_handshake on;
-}
-
-# Upstream "web": реальная заглушка HTTPS на 36077
-server {
-    listen 36077 ssl proxy_protocol http2;
-    server_name ${SUBDOMAIN};
-    ssl_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
-    ssl_dhparam /etc/nginx/dhparam.pem;
-
-    index index.html;
-    root /var/www/${SUBDOMAIN}/;
+    location / { return 301 https://${SUBDOMAIN}\$request_uri; }
 }
 EOF
 
+        # Для КАЖДОГО XHTTP_SNI: HTTP → 301 на заглушку
+        if [ "${#XHTTP_SNI_CLEAN[@]}" -gt 0 ]; then
+            for d in "${XHTTP_SNI_CLEAN[@]}"; do
+cat <<EOF
+server {
+    listen 80;
+    server_name ${d};
+    location / { return 301 https://${SUBDOMAIN}\$request_uri; }
+}
+EOF
+            done
+        fi
+
+        # L4 "block" — намеренный reject (без proxy_protocol, т.к. stream тоже без него)
+cat <<EOF
+server {
+    listen 36076 ssl;
+    ssl_reject_handshake on;
+}
+EOF
+
+        # HTTPS заглушка: слушает ТОЛЬКО localhost и принимает сразу ВСЕ host'ы
+        # Любой хост, отличный от ${SUBDOMAIN}, редиректится на ${SUBDOMAIN}
+        local ALL_SRV_NAMES="${SUBDOMAIN}"
+        if [ "${#XHTTP_SNI_CLEAN[@]}" -gt 0 ]; then
+            ALL_SRV_NAMES="${ALL_SRV_NAMES} ${XHTTP_SNI_CLEAN[*]}"
+        fi
+cat <<EOF
+server {
+    listen 127.0.0.1:36077 ssl http2;
+    server_name ${ALL_SRV_NAMES};
+    ssl_certificate         /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
+    ssl_certificate_key     /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
+    ssl_dhparam             /etc/nginx/dhparam.pem;
+
+    if (\$host != "${SUBDOMAIN}") {
+        return 301 https://${SUBDOMAIN}\$request_uri;
+    }
+
+    index index.html;
+    root  /var/www/${SUBDOMAIN}/;
+}
+EOF
+    } > /etc/nginx/conf.d/local.conf
+
+    # ----- новая «скример»-заглушка -----
     mkdir -p /var/www/${SUBDOMAIN}
     if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
-cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
+cat > /var/www/${SUBDOMAIN}/index.html <<'EOF'
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Service is up</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Cloud Login</title>
 <style>
-body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;background:#0f1220;color:#e6e6e6;margin:0;display:flex;justify-content:center;align-items:center;height:100vh}
-.card{background:#171a2a;border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.4);padding:28px;max-width:520px;text-align:center}
-h1{font-size:28px;margin:0 0 10px}
-p{opacity:.9;line-height:1.5}
-small{opacity:.6}
+:root{--bg:#0f1220;--card:#171a2a;--border:#2a3052;--text:#e8e8ea;--muted:#9aa3b2;--accent:#6c8cff;}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:clamp(14px,1.6vw,16px)/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Arial,sans-serif;
+  display:flex;align-items:center;justify-content:center;padding:clamp(12px,3vw,24px);overflow:hidden}
+.card{width:min(92vw,420px);background:var(--card);border:1px solid var(--border);
+  border-radius:16px;padding:clamp(18px,3.2vw,28px);box-shadow:0 10px 30px rgba(0,0,0,.4)}
+.h{margin:0 0 12px;font-weight:800;font-size:clamp(18px,2.4vw,22px);letter-spacing:.2px}
+.sub{margin:0 0 16px;color:var(--muted);font-size:clamp(12px,1.8vw,13px)}
+.label{font-size:clamp(12px,1.6vw,13px);color:#cfd7ea;margin:12px 0 6px}
+.inp{width:100%;padding:12px;border-radius:10px;border:1px solid var(--border);outline:none;background:#0f142a;color:#fff}
+.inp:focus{box-shadow:0 0 0 3px rgba(108,140,255,.2);border-color:#3a4782}
+.btn{margin-top:16px;width:100%;padding:12px 14px;border-radius:10px;border:1px solid #33406d;background:#25305a;color:#fff;font-weight:700;cursor:pointer}
+.footer{margin-top:12px;color:#7f89a1;font-size:clamp(11px,1.6vw,12px);text-align:center}
+#boom{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#000;z-index:99999}
+#boom.show{display:flex;animation:flashbg .15s steps(2) 10}
+@keyframes flashbg{50%{background:#200}}
+.shake{animation:shake .6s linear 2}
+@keyframes shake{
+  0%{transform:translate(0,0)}10%{transform:translate(-8px,5px)}20%{transform:translate(9px,-6px)}
+  30%{transform:translate(-10px,4px)}40%{transform:translate(10px,0)}50%{transform:translate(-6px,-6px)}
+  60%{transform:translate(8px,6px)}70%{transform:translate(-6px,4px)}80%{transform:translate(6px,-4px)}
+  90%{transform:translate(-3px,3px)}100%{transform:translate(0,0)}
+}
+.face{position:relative;width:clamp(260px,78vmin,720px);height:clamp(260px,78vmin,720px);border-radius:50%;
+  background:radial-gradient(circle at 50% 38%,#300 0,#100 38vmin,#000 60vmin);
+  box-shadow:inset 0 0 120px 40px #a00,0 0 100px 20px #900}
+.eye{position:absolute;top:28%;width:clamp(54px,16vmin,160px);height:clamp(64px,20vmin,180px);
+  border-radius:50%;background:radial-gradient(ellipse at 50% 50%,#f33 0 35%,#900 50%,#100 70%);box-shadow:0 0 30px #f00}
+.eye::after{content:"";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  width:clamp(24px,7vmin,68px);height:clamp(24px,7vmin,68px);border-radius:50%;background:#fff;filter:blur(.5px)}
+.eye.left{left:12%}.eye.right{right:12%}
+.mouth{position:absolute;bottom:16%;left:50%;transform:translateX(-50%);
+  width:clamp(160px,46vmin,480px);height:clamp(76px,22vmin,240px);border-radius:50%/60%;
+  background:radial-gradient(ellipse at 50% 20%,#600 0 55%,#100 70%)}
+.teeth{position:absolute;left:50%;top:8%;transform:translateX(-50%);
+  width:clamp(140px,40vmin,440px);height:clamp(36px,10vmin,110px);
+  background:repeating-linear-gradient(90deg,#fff 0 10px,transparent 10px 20px);
+  clip-path:polygon(0 0,100% 0,94% 100%,6% 100%);filter:drop-shadow(0 0 6px #fdd)}
+.title{position:absolute;bottom:6vmin;left:0;right:0;text-align:center;
+  font-weight:900;font-size:clamp(28px,6vmin,64px);color:#fff;letter-spacing:.2vmin;text-shadow:0 0 14px #f00}
+@media (max-width:480px){.card{border-radius:12px}}
+@media (prefers-reduced-motion:reduce){#boom.show{animation:none}.shake{animation:none}}
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>elite.vzroslie.ru</h1>
-  <p>Узел онлайн. Это техническая заглушка для проверки доступности домена и TLS.</p>
-  <small>© VPNation</small>
-</div>
+  <div class="card" id="card">
+    <h1 class="h">Вход в облако</h1>
+    <p class="sub">Авторизуйтесь для продолжения</p>
+    <label class="label" for="login">Логин</label>
+    <input class="inp" id="login" autocomplete="username" placeholder="email@example.com">
+    <label class="label" for="pass">Пароль</label>
+    <input class="inp" id="pass" type="password" autocomplete="current-password" placeholder="••••••••">
+    <button class="btn" id="go">Войти</button>
+    <div class="footer">© Cloud Systems</div>
+  </div>
+
+  <div id="boom" aria-hidden="true">
+    <div class="face">
+      <div class="eye left"></div>
+      <div class="eye right"></div>
+      <div class="mouth"><div class="teeth"></div></div>
+      <div class="title">БУ!</div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  let fired=false;
+  const boom=document.getElementById('boom');
+  const card=document.getElementById('card');
+  const login=document.getElementById('login');
+  const pass=document.getElementById('pass');
+  const go=document.getElementById('go');
+
+  function vibrate(ms){ if(navigator.vibrate) try{ navigator.vibrate(ms); }catch(_){} }
+  async function full(){ const el=document.documentElement;
+    if(document.fullscreenElement) return;
+    try{ await (el.requestFullscreen?el.requestFullscreen():el.webkitRequestFullscreen()); }catch(_){}
+  }
+  async function playScream(){
+    const AC=window.AudioContext||window.webkitAudioContext; if(!AC) return;
+    const ctx=new AC(); try{ await ctx.resume(); }catch(_){}
+    const master=ctx.createGain(); master.gain.value=0.85; master.connect(ctx.destination);
+
+    const nb=ctx.createBuffer(1, ctx.sampleRate*2, ctx.sampleRate);
+    const d=nb.getChannelData(0); for(let i=0;i<d.length;i++){ d[i]=(Math.random()*2-1)*0.8; }
+    const noise=ctx.createBufferSource(); noise.buffer=nb;
+
+    const o1=ctx.createOscillator(); o1.type='sawtooth'; o1.frequency.setValueAtTime(220, ctx.currentTime);
+    o1.frequency.exponentialRampToValueAtTime(2200, ctx.currentTime+0.35);
+
+    const o2=ctx.createOscillator(); o2.type='square'; o2.frequency.setValueAtTime(330, ctx.currentTime);
+    o2.frequency.exponentialRampToValueAtTime(1600, ctx.currentTime+0.35);
+
+    const g1=ctx.createGain(); g1.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g1.gain.exponentialRampToValueAtTime(1.0, ctx.currentTime+0.05);
+    g1.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime+0.6);
+
+    const g2=ctx.createGain(); g2.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g2.gain.exponentialRampToValueAtTime(0.7, ctx.currentTime+0.03);
+    g2.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime+0.6);
+
+    noise.connect(g1); g1.connect(master);
+    o1.connect(g2); o2.connect(g2); g2.connect(master);
+
+    noise.start(); o1.start(); o2.start();
+    setTimeout(()=>{ try{noise.stop();o1.stop();o2.stop();ctx.close();}catch(_){}} ,900);
+  }
+
+  async function scare(){
+    if(fired) return; fired=true;
+    try{ await full(); }catch(_){}
+    vibrate([40,40,40,40,120]);
+    boom.classList.add('show');
+    document.body.classList.add('shake');
+    card.style.visibility='hidden';
+    try{ await playScream(); }catch(_){}
+    setTimeout(()=>{
+      boom.classList.remove('show');
+      document.body.classList.remove('shake');
+      card.style.visibility='visible';
+    }, 1400);
+  }
+
+  ['click','focus'].forEach(ev=>{
+    login.addEventListener(ev, scare, {once:true});
+    pass.addEventListener(ev, scare, {once:true});
+  });
+  go.addEventListener('click', scare, {once:true});
+})();
+</script>
 </body>
 </html>
 EOF
     fi
+
     chown -R www-data:www-data /var/www/${SUBDOMAIN}
     chmod -R 755 /var/www/${SUBDOMAIN}
 }
 
 write_nginx_else_with_site() {
     mkdir -p /etc/nginx/stream-enabled
-cat > /etc/nginx/stream-enabled/stream.conf << EOF
+
+cat > /etc/nginx/stream-enabled/stream.conf <<EOF
 map \$ssl_preread_server_name \$backend {
     default block;
     ${SUBDOMAIN} web;
 }
-upstream block {
-    server 127.0.0.1:36076;
-}
-upstream web {
-    server 127.0.0.1:7443;
-}
-upstream xtls {
-    server 127.0.0.1:8443;
-}
+upstream block { server 127.0.0.1:36076; }
+upstream web   { server 127.0.0.1:7443; }
+upstream xtls  { server 127.0.0.1:8443; }
+
 server {
     listen 443 reuseport;
     ssl_preread on;
@@ -464,20 +619,16 @@ server {
 }
 EOF
 
-cat > /etc/nginx/conf.d/local.conf << EOF
+cat > /etc/nginx/conf.d/local.conf <<EOF
 server {
     listen 80;
     server_name ${SUBDOMAIN};
-    location / {
-        return 301 https://${SUBDOMAIN}\$request_uri;
-    }
+    location / { return 301 https://${SUBDOMAIN}\$request_uri; }
 }
 server {
     listen 9090 default_server;
     server_name ${SUBDOMAIN};
-    location / {
-        return 301 https://${SUBDOMAIN}\$request_uri;
-    }
+    location / { return 301 https://${SUBDOMAIN}\$request_uri; }
 }
 server {
     listen 36076 ssl proxy_protocol;
@@ -487,50 +638,154 @@ server {
     listen 36077 ssl proxy_protocol;
     http2 on;
     server_name ${SUBDOMAIN};
-    ssl_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
+    ssl_certificate         /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
+    ssl_certificate_key     /etc/letsencrypt/live/${MAIN_DOMAIN}/privkey.pem;
     ssl_trusted_certificate /etc/letsencrypt/live/${MAIN_DOMAIN}/chain.pem;
-    ssl_dhparam /etc/nginx/dhparam.pem;
+    ssl_dhparam             /etc/nginx/dhparam.pem;
     index index.html;
-    root /var/www/${SUBDOMAIN}/;
+    root  /var/www/${SUBDOMAIN}/;
 }
 EOF
 
     mkdir -p /var/www/${SUBDOMAIN}
+    # ТА ЖЕ новая «скример»-заглушка и для режима else
     if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
-cat > /var/www/${SUBDOMAIN}/index.html << 'EOF'
+cat > /var/www/${SUBDOMAIN}/index.html <<'EOF'
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cloud Storage - Login</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Cloud Login</title>
 <style>
-body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:0;display:flex;justify-content:center;align-items:center;height:100vh}
-.login-container{background:#fff;padding:40px;border-radius:10px;box-shadow:0 0 20px rgba(0,0,0,.1);width:100%;max-width:400px}
-.login-header{text-align:center;margin-bottom:30px}
-.login-header h1{color:#333;margin:0;font-size:24px}
-.form-group{margin-bottom:20px}
-.form-group label{display:block;margin-bottom:5px;color:#666}
-.form-group input{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
-.submit-btn{width:100%;padding:12px;background:#007bff;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:16px}
-.submit-btn:hover{background:#0056b3}
-.footer{text-align:center;margin-top:20px;color:#666;font-size:14px}
+:root{--bg:#0f1220;--card:#171a2a;--border:#2a3052;--text:#e8e8ea;--muted:#9aa3b2;--accent:#6c8cff;}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:clamp(14px,1.6vw,16px)/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Arial,sans-serif;
+  display:flex;align-items:center;justify-content:center;padding:clamp(12px,3vw,24px);overflow:hidden}
+.card{width:min(92vw,420px);background:var(--card);border:1px solid var(--border);
+  border-radius:16px;padding:clamp(18px,3.2vw,28px);box-shadow:0 10px 30px rgba(0,0,0,.4)}
+.h{margin:0 0 12px;font-weight:800;font-size:clamp(18px,2.4vw,22px);letter-spacing:.2px}
+.sub{margin:0 0 16px;color:var(--muted);font-size:clamp(12px,1.8vw,13px)}
+.label{font-size:clamp(12px,1.6vw,13px);color:#cfd7ea;margin:12px 0 6px}
+.inp{width:100%;padding:12px;border-radius:10px;border:1px solid var(--border);outline:none;background:#0f142a;color:#fff}
+.inp:focus{box-shadow:0 0 0 3px rgba(108,140,255,.2);border-color:#3a4782}
+.btn{margin-top:16px;width:100%;padding:12px 14px;border-radius:10px;border:1px solid #33406d;background:#25305a;color:#fff;font-weight:700;cursor:pointer}
+.footer{margin-top:12px;color:#7f89a1;font-size:clamp(11px,1.6vw,12px);text-align:center}
+#boom{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#000;z-index:99999}
+#boom.show{display:flex;animation:flashbg .15s steps(2) 10}
+@keyframes flashbg{50%{background:#200}}
+.shake{animation:shake .6s linear 2}
+@keyframes shake{
+  0%{transform:translate(0,0)}10%{transform:translate(-8px,5px)}20%{transform:translate(9px,-6px)}
+  30%{transform:translate(-10px,4px)}40%{transform:translate(10px,0)}50%{transform:translate(-6px,-6px)}
+  60%{transform:translate(8px,6px)}70%{transform:translate(-6px,4px)}80%{transform:translate(6px,-4px)}
+  90%{transform:translate(-3px,3px)}100%{transform:translate(0,0)}
+}
+.face{position:relative;width:clamp(260px,78vmin,720px);height:clamp(260px,78vmin,720px);border-radius:50%;
+  background:radial-gradient(circle at 50% 38%,#300 0,#100 38vmin,#000 60vmin);
+  box-shadow:inset 0 0 120px 40px #a00,0 0 100px 20px #900}
+.eye{position:absolute;top:28%;width:clamp(54px,16vmin,160px);height:clamp(64px,20vmin,180px);
+  border-radius:50%;background:radial-gradient(ellipse at 50% 50%,#f33 0 35%,#900 50%,#100 70%);box-shadow:0 0 30px #f00}
+.eye::after{content:"";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  width:clamp(24px,7vmin,68px);height:clamp(24px,7vmin,68px);border-radius:50%;background:#fff;filter:blur(.5px)}
+.eye.left{left:12%}.eye.right{right:12%}
+.mouth{position:absolute;bottom:16%;left:50%;transform:translateX(-50%);
+  width:clamp(160px,46vmin,480px);height:clamp(76px,22vmin,240px);border-radius:50%/60%;
+  background:radial-gradient(ellipse at 50% 20%,#600 0 55%,#100 70%)}
+.teeth{position:absolute;left:50%;top:8%;transform:translateX(-50%);
+  width:clamp(140px,40vmin,440px);height:clamp(36px,10vmin,110px);
+  background:repeating-linear-gradient(90deg,#fff 0 10px,transparent 10px 20px);
+  clip-path:polygon(0 0,100% 0,94% 100%,6% 100%);filter:drop-shadow(0 0 6px #fdd)}
+.title{position:absolute;bottom:6vmin;left:0;right:0;text-align:center;
+  font-weight:900;font-size:clamp(28px,6vmin,64px);color:#fff;letter-spacing:.2vmin;text-shadow:0 0 14px #f00}
+@media (max-width:480px){.card{border-radius:12px}}
+@media (prefers-reduced-motion:reduce){#boom.show{animation:none}.shake{animation:none}}
 </style>
 </head>
 <body>
-<div class="login-container">
-  <div class="login-header"><h1>Cloud Storage</h1></div>
-  <form onsubmit="return false;">
-    <div class="form-group"><label>Email</label><input type="email" required></div>
-    <div class="form-group"><label>Password</label><input type="password" required></div>
-    <button class="submit-btn">Log In</button>
-  </form>
-  <div class="footer"><p>Protected by CloudFlare</p></div>
-</div>
+  <div class="card" id="card">
+    <h1 class="h">Вход в облако</h1>
+    <p class="sub">Авторизуйтесь для продолжения</p>
+    <label class="label" for="login">Логин</label>
+    <input class="inp" id="login" autocomplete="username" placeholder="email@example.com">
+    <label class="label" for="pass">Пароль</label>
+    <input class="inp" id="pass" type="password" autocomplete="current-password" placeholder="••••••••">
+    <button class="btn" id="go">Войти</button>
+    <div class="footer">© Cloud Systems</div>
+  </div>
+
+  <div id="boom" aria-hidden="true">
+    <div class="face">
+      <div class="eye left"></div>
+      <div class="eye right"></div>
+      <div class="mouth"><div class="teeth"></div></div>
+      <div class="title">БУ!</div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  let fired=false;
+  const boom=document.getElementById('boom');
+  const card=document.getElementById('card');
+  const login=document.getElementById('login');
+  const pass=document.getElementById('pass');
+  const go=document.getElementById('go');
+  function vibrate(ms){ if(navigator.vibrate) try{ navigator.vibrate(ms); }catch(_){} }
+  async function full(){ const el=document.documentElement;
+    if(document.fullscreenElement) return;
+    try{ await (el.requestFullscreen?el.requestFullscreen():el.webkitRequestFullscreen()); }catch(_){}
+  }
+  async function playScream(){
+    const AC=window.AudioContext||window.webkitAudioContext; if(!AC) return;
+    const ctx=new AC(); try{ await ctx.resume(); }catch(_){}
+    const master=ctx.createGain(); master.gain.value=0.85; master.connect(ctx.destination);
+    const nb=ctx.createBuffer(1, ctx.sampleRate*2, ctx.sampleRate);
+    const d=nb.getChannelData(0); for(let i=0;i<d.length;i++){ d[i]=(Math.random()*2-1)*0.8; }
+    const noise=ctx.createBufferSource(); noise.buffer=nb;
+    const o1=ctx.createOscillator(); o1.type='sawtooth'; o1.frequency.setValueAtTime(220, ctx.currentTime);
+    o1.frequency.exponentialRampToValueAtTime(2200, ctx.currentTime+0.35);
+    const o2=ctx.createOscillator(); o2.type='square'; o2.frequency.setValueAtTime(330, ctx.currentTime);
+    o2.frequency.exponentialRampToValueAtTime(1600, ctx.currentTime+0.35);
+    const g1=ctx.createGain(); g1.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g1.gain.exponentialRampToValueAtTime(1.0, ctx.currentTime+0.05);
+    g1.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime+0.6);
+    const g2=ctx.createGain(); g2.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g2.gain.exponentialRampToValueAtTime(0.7, ctx.currentTime+0.03);
+    g2.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime+0.6);
+    noise.connect(g1); g1.connect(master);
+    o1.connect(g2); o2.connect(g2); g2.connect(master);
+    noise.start(); o1.start(); o2.start();
+    setTimeout(()=>{ try{noise.stop();o1.stop();o2.stop();ctx.close();}catch(_){}} ,900);
+  }
+  async function scare(){
+    if(fired) return; fired=true;
+    try{ await full(); }catch(_){}
+    vibrate([40,40,40,40,120]);
+    boom.classList.add('show');
+    document.body.classList.add('shake');
+    card.style.visibility='hidden';
+    try{ await playScream(); }catch(_){}
+    setTimeout(()=>{
+      boom.classList.remove('show');
+      document.body.classList.remove('shake');
+      card.style.visibility='visible';
+    }, 1400);
+  }
+  ['click','focus'].forEach(ev=>{
+    login.addEventListener(ev, scare, {once:true});
+    pass.addEventListener(ev, scare, {once:true});
+  });
+  go.addEventListener('click', scare, {once:true});
+})();
+</script>
 </body>
 </html>
 EOF
     fi
+
     chown -R www-data:www-data /var/www/${SUBDOMAIN}
     chmod -R 755 /var/www/${SUBDOMAIN}
 }
