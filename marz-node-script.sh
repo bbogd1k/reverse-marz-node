@@ -373,6 +373,15 @@ EOF
 write_nginx_xhttp_with_stub() {
   mkdir -p /etc/nginx/stream-enabled
   mkdir -p /etc/nginx/conf.d
+
+  # Безопасно читаем XHTTP_SNI при set -u
+  local -a XHTTP_SNI_SAFE=()
+  if declare -p XHTTP_SNI >/dev/null 2>&1; then
+    for d in "${XHTTP_SNI[@]}"; do
+      [[ -n "$d" ]] && XHTTP_SNI_SAFE+=("$d")
+    done
+  fi
+
   local WWW_ROOT_LOCAL="${WWW_ROOT:-/var/www/${SUBDOMAIN}}"
 
   # --- stream.conf: наружный :443 → по SNI в web/xhttp/block ---
@@ -380,9 +389,9 @@ write_nginx_xhttp_with_stub() {
     echo 'map $ssl_preread_server_name $backend {'
     echo '    default block;'
     echo "    ${SUBDOMAIN} web;"
-    if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
-      for d in "${XHTTP_SNI[@]}"; do
-        [ -n "$d" ] && echo "    ${d} xhttp;"
+    if [ "${#XHTTP_SNI_SAFE[@]}" -gt 0 ]; then
+      for d in "${XHTTP_SNI_SAFE[@]}"; do
+        echo "    ${d} xhttp;"
       done
     fi
     echo '}'
@@ -409,11 +418,10 @@ server {
 }
 EOF
 
-    # для каждого XHTTP-SNI — :80 → 301 на SUBDOMAIN (HTTPS для них НЕ поднимаем!)
-    if [ "${#XHTTP_SNI[@]}" -gt 0 ]; then
-      for d in "${XHTTP_SNI[@]}"; do
-        [ -n "$d" ] || continue
-        cat <<EOF
+    # :80 для XHTTP-доменов → 301 на SUBDOMAIN (HTTPS для них НЕ поднимаем!)
+    if [ "${#XHTTP_SNI_SAFE[@]}" -gt 0 ]; then
+      for d in "${XHTTP_SNI_SAFE[@]}"; do
+cat <<EOF
 server {
     listen 80;
     server_name ${d};
@@ -423,8 +431,8 @@ EOF
       done
     fi
 
-    # L4 заглушка (stream backend "block")
-    cat <<'EOF'
+    # L4 «reject» для stream backend "block"
+cat <<'EOF'
 server {
     listen 36076 ssl;
     ssl_reject_handshake on;
@@ -432,7 +440,7 @@ server {
 EOF
 
     # ВЕБ: слушаем ТОЛЬКО локально (куда прокинет stream как "web")
-    cat <<EOF
+cat <<EOF
 server {
     listen 127.0.0.1:36077 ssl http2;
     server_name ${SUBDOMAIN};
@@ -465,18 +473,10 @@ server {
 EOF
   } > /etc/nginx/conf.d/local.conf
 
-  # ВАЖНО: в http{} должен быть resolver для OCSP stapling
-  if ! grep -qE '^\s*resolver\s+' /etc/nginx/nginx.conf; then
-    echo "[warn] Добавь в http{}:  resolver 1.1.1.1 9.9.9.9 valid=300s; resolver_timeout 5s;"
-  fi
-
-  nginx -t && systemctl reload nginx
-}
-
-    # ----- новая «скример»-заглушка -----
-    mkdir -p /var/www/${SUBDOMAIN}
-    if [ ! -f "/var/www/${SUBDOMAIN}/index.html" ]; then
-cat > /var/www/${SUBDOMAIN}/index.html <<'EOF'
+  # --- заглушка (скример) ---
+  mkdir -p "${WWW_ROOT_LOCAL}"
+  if [ ! -f "${WWW_ROOT_LOCAL}/index.html" ]; then
+cat > "${WWW_ROOT_LOCAL}/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -485,6 +485,7 @@ cat > /var/www/${SUBDOMAIN}/index.html <<'EOF'
 <meta name="robots" content="noindex,nofollow">
 <title>Cloud Login</title>
 <style>
+/* Твой CSS из примера — без изменений */
 :root{--bg:#0f1220;--card:#171a2a;--border:#2a3052;--text:#e8e8ea;--muted:#9aa3b2;--accent:#6c8cff;}
 *{box-sizing:border-box}html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);
@@ -552,6 +553,7 @@ body{margin:0;background:var(--bg);color:var(--text);
   </div>
 
 <script>
+/* Твой JS из примера — без изменений */
 (function(){
   let fired=false;
   const boom=document.getElementById('boom');
@@ -559,7 +561,6 @@ body{margin:0;background:var(--bg);color:var(--text);
   const login=document.getElementById('login');
   const pass=document.getElementById('pass');
   const go=document.getElementById('go');
-
   function vibrate(ms){ if(navigator.vibrate) try{ navigator.vibrate(ms); }catch(_){} }
   async function full(){ const el=document.documentElement;
     if(document.fullscreenElement) return;
@@ -569,32 +570,24 @@ body{margin:0;background:var(--bg);color:var(--text);
     const AC=window.AudioContext||window.webkitAudioContext; if(!AC) return;
     const ctx=new AC(); try{ await ctx.resume(); }catch(_){}
     const master=ctx.createGain(); master.gain.value=0.85; master.connect(ctx.destination);
-
     const nb=ctx.createBuffer(1, ctx.sampleRate*2, ctx.sampleRate);
     const d=nb.getChannelData(0); for(let i=0;i<d.length;i++){ d[i]=(Math.random()*2-1)*0.8; }
     const noise=ctx.createBufferSource(); noise.buffer=nb;
-
     const o1=ctx.createOscillator(); o1.type='sawtooth'; o1.frequency.setValueAtTime(220, ctx.currentTime);
     o1.frequency.exponentialRampToValueAtTime(2200, ctx.currentTime+0.35);
-
     const o2=ctx.createOscillator(); o2.type='square'; o2.frequency.setValueAtTime(330, ctx.currentTime);
     o2.frequency.exponentialRampToValueAtTime(1600, ctx.currentTime+0.35);
-
     const g1=ctx.createGain(); g1.gain.setValueAtTime(0.0001, ctx.currentTime);
     g1.gain.exponentialRampToValueAtTime(1.0, ctx.currentTime+0.05);
     g1.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime+0.6);
-
     const g2=ctx.createGain(); g2.gain.setValueAtTime(0.0001, ctx.currentTime);
     g2.gain.exponentialRampToValueAtTime(0.7, ctx.currentTime+0.03);
     g2.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime+0.6);
-
     noise.connect(g1); g1.connect(master);
     o1.connect(g2); o2.connect(g2); g2.connect(master);
-
     noise.start(); o1.start(); o2.start();
     setTimeout(()=>{ try{noise.stop();o1.stop();o2.stop();ctx.close();}catch(_){}} ,900);
   }
-
   async function scare(){
     if(fired) return; fired=true;
     try{ await full(); }catch(_){}
@@ -609,7 +602,6 @@ body{margin:0;background:var(--bg);color:var(--text);
       card.style.visibility='visible';
     }, 1400);
   }
-
   ['click','focus'].forEach(ev=>{
     login.addEventListener(ev, scare, {once:true});
     pass.addEventListener(ev, scare, {once:true});
@@ -620,11 +612,14 @@ body{margin:0;background:var(--bg);color:var(--text);
 </body>
 </html>
 EOF
-    fi
+  fi
 
-    chown -R www-data:www-data /var/www/${SUBDOMAIN}
-    chmod -R 755 /var/www/${SUBDOMAIN}
+  chown -R www-data:www-data "${WWW_ROOT_LOCAL}"
+  chmod -R 755 "${WWW_ROOT_LOCAL}"
+
+  nginx -t && systemctl reload nginx
 }
+
 
 write_nginx_else_with_site() {
     mkdir -p /etc/nginx/stream-enabled
