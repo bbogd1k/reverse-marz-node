@@ -339,7 +339,7 @@ http {
     default_type application/octet-stream;
 
     ssl_session_timeout 1d;
-    ssl_session_cache shared:SSL:1m;
+    ssl_session_cache shared:SSL:20m;
     ssl_session_tickets off;
     ssl_prefer_server_ciphers on;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -442,7 +442,8 @@ EOF
     # ВЕБ: слушаем ТОЛЬКО локально (куда прокинет stream как "web")
 cat <<EOF
 server {
-    listen 127.0.0.1:36077 ssl http2;
+    listen 127.0.0.1:36077 ssl;
+    http2 on;
     server_name ${SUBDOMAIN};
 
     ssl_certificate         /etc/letsencrypt/live/${MAIN_DOMAIN}/fullchain.pem;
@@ -455,7 +456,6 @@ server {
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers on;
 
-    ssl_session_cache shared:SSL:20m;
     ssl_session_timeout 1d;
     ssl_session_tickets off;
 
