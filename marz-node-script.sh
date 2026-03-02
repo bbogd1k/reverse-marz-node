@@ -552,7 +552,8 @@ export NODE_NAME SERVICE_PORT API_PORT
 
 expect << 'EOF'
 log_user 1
-set timeout 600
+set timeout 900
+set logs_tail_stopped 0
 
 spawn ./marzban-node.sh @ install --name $env(NODE_NAME)
 
@@ -567,6 +568,23 @@ expect {
   -re "Do you want to use REST protocol" { send -- "y\r"; exp_continue }
   -re "Enter the SERVICE_PORT" { send -- "$env(SERVICE_PORT)\r"; exp_continue }
   -re "Enter the XRAY_API_PORT" { send -- "$env(API_PORT)\r"; exp_continue }
+  -re "(Node service running on|Uvicorn running on|Application startup complete)" {
+      if {$logs_tail_stopped == 0} {
+        # marzban-node installer may switch to `docker logs -f` and never return.
+        # Stop the log tail so the parent script can continue.
+        send -- "\003"
+        set logs_tail_stopped 1
+      }
+      exp_continue
+  }
+  timeout {
+      if {$logs_tail_stopped == 0} {
+        send -- "\003"
+        set logs_tail_stopped 1
+        exp_continue
+      }
+      send_user "\n[WARNING] Timeout while waiting marzban-node installer to finish. Continuing...\n"
+  }
   eof
 }
 EOF
