@@ -599,6 +599,15 @@ chmod 755 /var/lib/marzban/log
 chmod 644 /var/lib/marzban/log/access.log
 
 if [[ -f "${DOCKER_COMPOSE_FILE}" ]]; then
+  # добавим XRAY_EXECUTABLE_PATH в environment, если его ещё нет
+  if ! grep -q "XRAY_EXECUTABLE_PATH:" "${DOCKER_COMPOSE_FILE}"; then
+    if grep -qE '^\s*environment:\s*$' "${DOCKER_COMPOSE_FILE}"; then
+      sed -i '/^\s*environment:\s*$/a\      XRAY_EXECUTABLE_PATH: /var/lib/marzban-node/xray-core/xray' "${DOCKER_COMPOSE_FILE}"
+    else
+      sed -i '0,/^\s*network_mode:\s*/s//&\n    environment:\n      XRAY_EXECUTABLE_PATH: \/var\/lib\/marzban-node\/xray-core\/xray\n/' "${DOCKER_COMPOSE_FILE}"
+    fi
+  fi
+
   # добавим volume, если его ещё нет
   if ! grep -q "/var/lib/marzban/log:/var/lib/marzban/log" "${DOCKER_COMPOSE_FILE}"; then
     # если volumes: есть — допишем; если нет — создадим в сервисе
